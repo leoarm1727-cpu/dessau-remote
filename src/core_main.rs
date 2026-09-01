@@ -200,10 +200,6 @@ pub fn core_main() -> Option<Vec<String>> {
         {
             crate::platform::try_remove_temp_update_files();
             hbb_common::config::PeerConfig::preload_peers();
-            // Fork Dessau: lanzar el agente de monitoreo de productividad en su
-            // propio hilo. Es autónomo (no habla con RustDesk); si no hay config
-            // (DESSAU_MONITOREO_URL) sale de inmediato. Ver src/monitoreo.rs.
-            std::thread::spawn(|| crate::monitoreo::ejecutar());
         }
         std::thread::spawn(move || crate::start_server(false, no_server));
     } else {
@@ -382,6 +378,15 @@ pub fn core_main() -> Option<Vec<String>> {
             }
         } else if args[0] == "--tray" {
             if !crate::check_process("--tray", true) {
+                // Fork Dessau: el agente de monitoreo vive en el proceso `--tray`
+                // porque es el que Windows autoarranca en CADA logon (acceso directo
+                // en la carpeta Startup) y el único que corre en la sesión interactiva
+                // del usuario (necesario para GetForegroundWindow/GetLastInputInfo).
+                // check_process garantiza una sola instancia por sesión ⇒ un solo
+                // agente, sin doble reporte. Se lanza en su hilo ANTES de start_tray,
+                // que es bloqueante. Autónomo (no habla con RustDesk). Ver monitoreo.rs.
+                #[cfg(windows)]
+                std::thread::spawn(|| crate::monitoreo::ejecutar());
                 crate::tray::start_tray();
             }
             return None;

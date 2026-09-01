@@ -110,8 +110,32 @@ públicamente. Este paso va PRIMERO.
 
 ## Config del agente en cada PC
 
-Ver `dessau-agente.env.ejemplo`. Poner `DESSAU_MONITOREO_URL` (según la red),
-`DESSAU_MONITOREO_SECRET` e `INTERVALO`. Sin URL, el agente queda inerte.
+Ver `dessau-agente.env.ejemplo`. El agente lee, EN ESTE ORDEN:
+1. el archivo `%ProgramData%\Dessau\monitoreo\config` (formato `KEY=VALUE`), que
+   el instalador debe escribir con ACL **sólo Administrators+SYSTEM** (icacls,
+   quitando `Users`) para que el secreto no quede legible por cualquier usuario;
+2. las variables de entorno del proceso (fallback).
+
+Claves: `DESSAU_MONITOREO_URL` (la edge function de Gestión Dessau, la MISMA en
+cualquier red), `DESSAU_MONITOREO_SECRET` (= `monitoreo_device_auth.secret` del
+proyecto, o la edge da 401), `DESSAU_MONITOREO_APIKEY` (opcional, sólo si la edge
+está con `verify_jwt=true`) y `DESSAU_MONITOREO_INTERVALO` (semilla). Sin URL, el
+agente queda **inerte**.
+
+## Comportamiento (actualizado 2026-09-01)
+
+- **Sin registro de usuario**: el equipo se identifica por hostname + IP; no hay login.
+- **Registra IP + nombre y detecta cambios**: en cada latido reporta la IP LAN
+  (elegida hacia el servidor, robusto en PCs multi-homed) y el hostname; el
+  BACKEND (trigger sobre `monitoreo_dispositivos`) detecta y audita si cambian.
+  El agente además lleva un archivo de estado local y marca `cambio_red`.
+- **Autoarranca**: el agente se lanza en el proceso `--tray` (core_main.rs), que
+  Windows autoarranca en CADA logon y corre en la sesión del usuario. Se ejecuta
+  **apenas se instala** y **en cada arranque**, una sola instancia por sesión.
+- **La política vive en el servidor**: arranca con el seguimiento APAGADO; el
+  primer latido da de alta el equipo y trae la config vigente (encender/apagar,
+  intervalos, captura de títulos). Apagar desde Admin → Monitoreo apaga el agente.
+- **Destino = Gestión Dessau** (edge `monitoreo-actividad-device`), NO Gauzy.
 
 ## Recordatorio de arquitectura
 
