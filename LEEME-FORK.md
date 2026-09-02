@@ -129,12 +129,17 @@ agente queda **inerte**.
   (elegida hacia el servidor, robusto en PCs multi-homed) y el hostname; el
   BACKEND (trigger sobre `monitoreo_dispositivos`) detecta y audita si cambian.
   El agente además lleva un archivo de estado local y marca `cambio_red`.
-- **Autoarranca**: el agente se lanza en el proceso `--tray` (core_main.rs), que
-  Windows autoarranca en CADA logon y corre en la sesión del usuario. Se ejecuta
-  **apenas se instala** y **en cada arranque**, una sola instancia por sesión.
-- **La política vive en el servidor**: arranca con el seguimiento APAGADO; el
-  primer latido da de alta el equipo y trae la config vigente (encender/apagar,
-  intervalos, captura de títulos). Apagar desde Admin → Monitoreo apaga el agente.
+- **Autoarranca en el SERVICIO (SYSTEM)**: el agente se lanza en el proceso
+  `--service` (core_main.rs), que Windows autoarranca en CADA arranque
+  (`sc … start=auto`), **antes del login**, como LocalSystem. Así lee el config
+  protegido (ACL Admin+SYSTEM) **sin exponer el secreto a los usuarios** y funciona
+  en PCs de usuario estándar. Cumple "corre apenas se prenda la computadora".
+- **Fase 1 = REGISTRO**: late con la identidad del equipo (sin actividad) y recibe
+  del servidor el intervalo. La MEDICIÓN de actividad (apps/ocio) es **Fase 2**:
+  necesita la sesión del usuario (el servicio, en la sesión 0, no ve el escritorio),
+  irá en el tray y entregará las muestras al servicio por IPC para que el secreto
+  nunca salga del contexto SYSTEM. El indicador/aviso visible de Ley 29733 también
+  es Fase 2; hoy la transparencia la da el aviso a los trabajadores fuera de banda.
 - **Destino = Gestión Dessau** (edge `monitoreo-actividad-device`), NO Gauzy.
 
 ## Recordatorio de arquitectura

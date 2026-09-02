@@ -1,47 +1,50 @@
 // =============================================================================
-//  Agente de monitoreo de productividad — fusionado en el cliente RustDesk
+//  Agente de monitoreo Dessau — fusionado en el cliente RustDesk
 // -----------------------------------------------------------------------------
 //  ⚠️ AVISO AGPL-3.0: este archivo es una MODIFICACIÓN al cliente RustDesk
 //  (AGPL-3.0). Al distribuir este fork a las PCs, la empresa queda obligada por
 //  la cláusula 13 de la AGPL a ofrecer el código fuente COMPLETO de esta versión
 //  modificada a todos los usuarios que interactúen con ella por red. El código de
-//  este agente (cómo mide, qué reporta) queda por tanto PÚBLICO. NO poner aquí
-//  secretos, claves ni endpoints: van por configuración externa (archivo con ACL
-//  o variables de entorno), NUNCA horneados en el binario. Ver LEEME-FORK.md.
+//  este agente (qué reporta) queda por tanto PÚBLICO. NO poner aquí secretos,
+//  claves ni endpoints: van por configuración externa (archivo con ACL o
+//  variables de entorno), NUNCA horneados en el binario. Ver LEEME-FORK.md.
 //
-//  Diseño: hilo independiente lanzado desde core_main.rs al arrancar el proceso
-//  `--tray` (el que Windows autoarranca en CADA logon y corre en la sesión
-//  interactiva del usuario). Mide en Windows con Win32 (GetLastInputInfo,
-//  GetForegroundWindow) y reporta por HTTP con reqwest (ya dependencia). NO se
-//  comunica con el resto de RustDesk: es lógica autónoma que coexiste en el
-//  mismo binario.
+//  Diseño: hilo independiente lanzado desde core_main.rs en el proceso `--service`,
+//  que Windows autoarranca en CADA arranque (sc ... start=auto), ANTES del login, y
+//  corre como LocalSystem. Por eso puede leer el config protegido (ACL sólo
+//  Admin+SYSTEM) sin exponer el secreto a los usuarios, y funciona en PCs de
+//  usuario estándar. NO se comunica con el resto de RustDesk: es lógica autónoma.
 //
-//  Destino: la app Gestión Dessau (edge function `monitoreo-actividad-device`
-//  de Supabase), NO Gauzy. El agente:
-//    1. DA DE ALTA el equipo por hostname + IP (sin registrar usuario): el
-//       backend detecta y audita si la IP o el nombre del equipo cambian.
-//    2. OBEDECE la política que devuelve el servidor en cada latido (encender/
-//       apagar seguimiento, cada cuánto muestrear, capturar títulos, etc.): la
-//       política vive en el servidor, no en el agente (Ley 29733: TI manda).
-//    3. Reporta la actividad (activo/ocioso) como intervalos, sólo si el
-//       servidor lo tiene ENCENDIDO (arranca apagado).
+//  ALCANCE (Fase 1) = REGISTRO del equipo. El agente:
+//    1. DA DE ALTA el equipo por hostname + IP (sin registrar usuario): el backend
+//       detecta y audita si la IP o el nombre del equipo cambian.
+//    2. Late periódicamente (mantiene "visto por última vez") y recibe del servidor
+//       el intervalo de latido.
+//  La medición de ACTIVIDAD (apps/ocio/foreground) es FASE 2: necesita la sesión
+//  interactiva del usuario (GetForegroundWindow/GetLastInputInfo NO ven el
+//  escritorio desde el servicio en la sesión 0). Irá en el tray, entregando las
+//  muestras al servicio por IPC para que el secreto nunca salga del contexto SYSTEM.
 // =============================================================================
 
 #![cfg(windows)]
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// `log` NO es dependencia directa del crate; se usa vía el re-export de hbb_common
+// (igual que core_main.rs). Sin este `use`, las macros log::* no resuelven (E0433).
+use hbb_common::log;
 
 /// Versión del AGENTE (distinta de la versión del cliente RustDesk): así el panel
 /// distingue iteraciones del agente de las del cliente. Bumpear al cambiar el agente.
 const AGENTE_VERSION: &str = concat!("dessau-monitoreo/", env!("CARGO_PKG_VERSION"));
 
-// ── Configuración de arranque (URL + secreto) ────────────────────────────────
+// ── Configuración (URL + secreto) ────────────────────────────────────────────
 //  Orden de lectura: 1) archivo %ProgramData%\Dessau\monitoreo\config (ACL sólo
 //  Administrators+SYSTEM, lo escribe el instalador), 2) variables de entorno.
-//  El archivo es más robusto que el entorno para un proceso de arranque y permite
-//  rotar el secreto/servidor sin depender de que el proceso herede setx /M.
+//  Como el agente corre como SYSTEM (servicio), lee ese archivo sin problema y el
+//  secreto queda ilegible para los usuarios estándar de la PC.
 struct Config {
     url: String,
     secret: String,
@@ -97,90 +100,26 @@ impl Config {
     }
 }
 
-/// Política vigente. Arranca CONSERVADORA (seguimiento apagado): el agente sólo
-/// da de alta el equipo y consulta config hasta que TI encienda el seguimiento.
+/// Política vigente. En Fase 1 sólo interesa cada cuánto latir; el servidor manda.
 struct Politica {
-    seguimiento: bool,
-    equipo_habilitado: bool,
-    muestreo_seg: u64,
     envio_seg: u64,
-    idle_seg: u64,
-    capturar_titulos: bool,
 }
 
 impl Politica {
     fn semilla(envio_seg: u64) -> Self {
-        Politica {
-            seguimiento: false,      // arranca APAGADO; el servidor manda
-            equipo_habilitado: true,
-            muestreo_seg: 15,
-            envio_seg,
-            idle_seg: 300,
-            capturar_titulos: false, // hasta que el servidor lo permita
-        }
+        Politica { envio_seg }
     }
 
-    /// Actualiza desde el objeto `config` que devuelve la edge (defensivo: si falta
-    /// una clave, conserva el valor previo).
+    /// Actualiza desde el objeto `config` que devuelve la edge (defensivo).
     fn aplicar(&mut self, c: &serde_json::Value) {
-        if let Some(b) = c.get("seguimiento_actividad").and_then(|v| v.as_bool()) {
-            self.seguimiento = b;
-        }
-        if let Some(b) = c.get("equipo_habilitado").and_then(|v| v.as_bool()) {
-            self.equipo_habilitado = b;
-        }
-        if let Some(n) = c.get("muestreo_seg").and_then(|v| v.as_u64()) {
-            self.muestreo_seg = n.clamp(5, 3600);
-        }
         if let Some(n) = c.get("envio_seg").and_then(|v| v.as_u64()) {
             self.envio_seg = n.clamp(15, 3600);
         }
-        if let Some(n) = c.get("idle_seg").and_then(|v| v.as_u64()) {
-            self.idle_seg = n.clamp(30, 7200);
-        }
-        if let Some(b) = c.get("capturar_titulos").and_then(|v| v.as_bool()) {
-            self.capturar_titulos = b;
-        }
-    }
-}
-
-// ── Primitivas de medición (por-sesión: sólo válidas en la sesión del usuario) ─
-
-/// Milisegundos que el usuario lleva inactivo (sin teclado ni mouse).
-fn inactividad_ms() -> u64 {
-    use winapi::um::sysinfoapi::GetTickCount;
-    use winapi::um::winuser::{GetLastInputInfo, LASTINPUTINFO};
-    unsafe {
-        let mut lii = LASTINPUTINFO {
-            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-            dwTime: 0,
-        };
-        if GetLastInputInfo(&mut lii) == 0 {
-            return 0;
-        }
-        let ahora = GetTickCount();
-        ahora.wrapping_sub(lii.dwTime) as u64
-    }
-}
-
-/// Título de la ventana en primer plano (app que el usuario está usando).
-fn ventana_primer_plano() -> String {
-    use winapi::um::winuser::{GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW};
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_null() {
-            return String::new();
-        }
-        let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
-            return String::new();
-        }
-        let mut buf: Vec<u16> = vec![0u16; (len + 1) as usize];
-        let leidos = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        if leidos <= 0 {
-            return String::new();
-        }
-        String::from_utf16_lossy(&buf[..leidos as usize])
+        // FASE 2: la edge también devuelve seguimiento_actividad, muestreo_seg,
+        // idle_seg, capturar_titulos/urls, aviso_texto/aviso_version y tiempo_privado_*.
+        // El REGISTRO no los necesita. La medición de actividad (tray) los consumirá,
+        // e implementará el indicador/aviso visible de Ley 29733 que hoy queda cubierto
+        // por el aviso a los trabajadores fuera de banda (obligatorio antes de encender).
     }
 }
 
@@ -212,7 +151,7 @@ fn so_windows() -> String {
     }
 }
 
-/// IP LAN de origen HACIA el servidor de reporte. Trucos de socket UDP "connect"
+/// IP LAN de origen HACIA el servidor de reporte. Truco de socket UDP "connect"
 /// (no envía tráfico): el SO elige la interfaz que usaría para alcanzar ese host,
 /// que en una PC multi-homed (red 0.x oficina vs 10.x aislada) es justo la correcta.
 fn ip_local_hacia(endpoint: &str) -> Option<String> {
@@ -243,46 +182,29 @@ fn detectar_cambio_red(ip: Option<&str>, host: &str) -> bool {
         Some(p) => p.trim() != actual, // hay valor previo y difiere
         None => false,                 // primer arranque: no es un "cambio"
     };
-    // (re)escribir el estado de forma atómica
-    let _ = std::fs::create_dir_all(&dir);
-    let tmp = dir.join("estado.tmp");
-    if let Ok(mut f) = std::fs::File::create(&tmp) {
-        if f.write_all(actual.as_bytes()).is_ok() {
-            let _ = std::fs::rename(&tmp, &ruta);
+    // Escribir solo si cambió o si aún no había estado (primer arranque): evita
+    // reescribir el archivo en cada latido. Escritura atómica (.tmp + rename).
+    if cambio || previo.is_none() {
+        let _ = std::fs::create_dir_all(&dir);
+        let tmp = dir.join("estado.tmp");
+        if let Ok(mut f) = std::fs::File::create(&tmp) {
+            if f.write_all(actual.as_bytes()).is_ok() {
+                let _ = std::fs::rename(&tmp, &ruta);
+            }
         }
     }
     cambio
 }
 
-// ── Buffer de intervalos de actividad ────────────────────────────────────────
-struct Abierto {
-    inicio: chrono::DateTime<chrono::Utc>,
-    fin: chrono::DateTime<chrono::Utc>,
-    estado: &'static str,
-    titulo: Option<String>,
-}
-
-fn cerrar(a: Abierto) -> serde_json::Value {
-    serde_json::json!({
-        "inicio": a.inicio.to_rfc3339(),
-        "fin": a.fin.to_rfc3339(),
-        "app": serde_json::Value::Null,       // Fase 2: nombre del .exe (P/Invoke extra)
-        "appNombre": serde_json::Value::Null,
-        "titulo": a.titulo,                    // null si capturar_titulos=false
-        "url": serde_json::Value::Null,        // Fase 2: URL del navegador (UI Automation)
-        "estado": a.estado,
-    })
-}
-
-/// Un flush: envía el lote (o vacío = latido) y devuelve la config vigente del servidor.
-fn enviar(
+/// Un latido de REGISTRO: reporta la identidad del equipo (sin muestras de
+/// actividad, que son Fase 2) y devuelve la config vigente del servidor.
+fn latido(
     cliente: &reqwest::blocking::Client,
     cfg: &Config,
     host: &str,
     ip: Option<&str>,
     so: &str,
     cambio_red: bool,
-    muestras: Vec<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let payload = serde_json::json!({
         "dispositivo": host,
@@ -291,7 +213,7 @@ fn enviar(
         "so": so,
         "agenteVersion": AGENTE_VERSION,
         "cambio_red": cambio_red,
-        "muestras": muestras,
+        "muestras": [],   // Fase 1: registro puro; la actividad es Fase 2 (tray).
     });
     let mut req = cliente
         .post(&cfg.url)
@@ -309,8 +231,12 @@ fn enviar(
     Ok(body.get("config").cloned().unwrap_or(serde_json::Value::Null))
 }
 
-/// Bucle del agente. Se ejecuta en su propio hilo; nunca retorna mientras el
-/// proceso viva. Si no hay config (sin URL), sale de inmediato (agente inerte).
+/// Bucle del agente. Se ejecuta en su propio hilo (SYSTEM, en el servicio); nunca
+/// retorna mientras el proceso viva. Sin config (sin URL) sale de inmediato (inerte).
+///
+/// ⚠️ El perfil release del fork usa `panic = 'abort'`: un panic acá tumbaría el
+/// servicio. Todas las rutas usan `?`/unwrap_or/opciones — NO introducir unwrap ni
+/// indexado sin guarda en este módulo.
 pub fn ejecutar() {
     let cfg = match Config::cargar() {
         Some(c) => c,
@@ -319,7 +245,7 @@ pub fn ejecutar() {
             return;
         }
     };
-    log::info!("[monitoreo] agente {} iniciado, reporta a {}", AGENTE_VERSION, cfg.url);
+    log::info!("[monitoreo] agente {} iniciado (registro), reporta a {}", AGENTE_VERSION, cfg.url);
 
     let cliente = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -336,74 +262,15 @@ pub fn ejecutar() {
     let so = so_windows();
     let mut pol = Politica::semilla(cfg.envio_seg_semilla);
 
-    // Latido inmediato: DA DE ALTA el equipo (IP + hostname) apenas arranca —
-    // apenas se instala / apenas se prende la PC — y trae la config vigente.
-    {
+    // Latido inmediato: da de alta el equipo (hostname + IP) apenas arranca la PC,
+    // antes del login; luego uno cada envio_seg. El backend detecta cambios de IP/nombre.
+    loop {
         let ip = ip_local_hacia(&cfg.url);
         let cambio = detectar_cambio_red(ip.as_deref(), &host);
-        match enviar(&cliente, &cfg, &host, ip.as_deref(), &so, cambio, vec![]) {
+        match latido(&cliente, &cfg, &host, ip.as_deref(), &so, cambio) {
             Ok(c) => pol.aplicar(&c),
-            Err(e) => log::warn!("[monitoreo] alta inicial falló: {e}"),
+            Err(e) => log::warn!("[monitoreo] latido falló: {e}"),
         }
-    }
-
-    let mut buf: Vec<serde_json::Value> = vec![];
-    let mut abierto: Option<Abierto> = None;
-    let mut ultimo_envio = Instant::now();
-
-    loop {
-        std::thread::sleep(Duration::from_secs(pol.muestreo_seg));
-
-        // 1) Medir SÓLO si TI tiene el seguimiento encendido para este equipo.
-        //    Si está apagado, no medimos (privacidad) pero igual latimos abajo
-        //    para refrescar el alta del equipo y recibir la config.
-        if pol.seguimiento && pol.equipo_habilitado {
-            let idle = inactividad_ms();
-            let estado: &'static str = if idle >= pol.idle_seg * 1000 { "ocioso" } else { "activo" };
-            let titulo = if pol.capturar_titulos {
-                let t = ventana_primer_plano();
-                if t.is_empty() { None } else { Some(t) }
-            } else {
-                None
-            };
-            let ahora = chrono::Utc::now();
-            let extender = matches!(&abierto, Some(a) if a.estado == estado);
-            if extender {
-                // mismo estado: extender el intervalo abierto
-                let a = abierto.as_mut().unwrap();
-                a.fin = ahora;
-                a.titulo = titulo;
-            } else {
-                // cambió el estado: cerrar el abierto y abrir uno nuevo
-                if let Some(a) = abierto.take() {
-                    buf.push(cerrar(a));
-                }
-                abierto = Some(Abierto { inicio: ahora, fin: ahora, estado, titulo });
-            }
-        }
-
-        // 2) Flush cada envio_seg (siempre: aunque no haya muestras, es el latido
-        //    que mantiene el alta del equipo y trae la política actualizada).
-        if ultimo_envio.elapsed().as_secs() >= pol.envio_seg {
-            if let Some(a) = abierto.take() {
-                buf.push(cerrar(a));
-            }
-            let muestras = std::mem::take(&mut buf);
-            let ip = ip_local_hacia(&cfg.url);
-            let cambio = detectar_cambio_red(ip.as_deref(), &host);
-            match enviar(&cliente, &cfg, &host, ip.as_deref(), &so, cambio, muestras) {
-                Ok(c) => pol.aplicar(&c),
-                // Fase 2: en fallo, bufferear a disco y reintentar (offline). Hoy se
-                // pierden las muestras del lote fallido; el alta se reintenta al próximo.
-                Err(e) => log::warn!("[monitoreo] latido falló: {e}"),
-            }
-            ultimo_envio = Instant::now();
-
-            // Si TI apagó el seguimiento, no acumular nada.
-            if !pol.seguimiento || !pol.equipo_habilitado {
-                buf.clear();
-                abierto = None;
-            }
-        }
+        std::thread::sleep(Duration::from_secs(pol.envio_seg));
     }
 }
