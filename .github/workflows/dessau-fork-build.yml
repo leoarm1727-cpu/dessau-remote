@@ -72,3 +72,40 @@ jobs:
           name: dessau-rustdesk-windows
           path: flutter/build/windows/x64/runner/Release
           if-no-files-found: error
+
+      # Arma y FIRMA el instalador único Dessau-Setup.exe (Inno). Solo si están los
+      # secrets (CERT_PFX_* + DESSAU_MONITOREO_SECRET); si faltan, se SALTA sin romper
+      # el build (el artifact de la app igual queda). Firma el rustdesk.exe de la app
+      # y el instalador+desinstalador con el certificado Dessau.
+      - name: Instalador Inno + firma (si estan los secrets)
+        shell: pwsh
+        env:
+          CERT_PFX_BASE64: ${{ secrets.CERT_PFX_BASE64 }}
+          CERT_PFX_PASSWORD: ${{ secrets.CERT_PFX_PASSWORD }}
+          DESSAU_MONITOREO_SECRET: ${{ secrets.DESSAU_MONITOREO_SECRET }}
+          DESSAU_MONITOREO_URL: ${{ vars.DESSAU_MONITOREO_URL }}
+        run: |
+          if (-not $env:DESSAU_MONITOREO_SECRET -or -not $env:CERT_PFX_BASE64) {
+            Write-Host "== Secrets del instalador ausentes (DESSAU_MONITOREO_SECRET / CERT_PFX_BASE64). Salto el instalador; el artifact de la app queda igual. =="
+            exit 0
+          }
+          choco install innosetup --no-progress -y
+          $pfx = "$env:RUNNER_TEMP\dessau.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+          $st  = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
+          $app = "flutter\build\windows\x64\runner\Release"
+          & $st sign /f $pfx /p $env:CERT_PFX_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 "$app\rustdesk.exe"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $sign = "`"$st`" sign /f `"$pfx`" /p `"$env:CERT_PFX_PASSWORD`" /fd sha256 /tr http://timestamp.digicert.com /td sha256 `$f"
+          $env:DESSAU_APP_DIR = (Resolve-Path $app).Path
+          & $iscc /DFirmar "/Sdessau=$sign" installer\dessau-monitor.iss
+          Remove-Item $pfx -Force
+          Get-AuthenticodeSignature installer\Output\Dessau-Setup.exe | Format-List Status, SignerCertificate
+
+      - name: Subir instalador firmado (si se genero)
+        if: ${{ hashFiles('installer/Output/Dessau-Setup.exe') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dessau-Setup
+          path: installer/Output/Dessau-Setup.exe
+          if-no-files-found: error

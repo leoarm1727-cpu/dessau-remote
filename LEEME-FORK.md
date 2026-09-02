@@ -154,6 +154,22 @@ agente queda **inerte**.
   es Fase 2; hoy la transparencia la da el aviso a los trabajadores fuera de banda.
 - **Destino = Gestión Dessau** (edge `monitoreo-actividad-device`), NO Gauzy.
 
+## Instalador único firmado (Dessau-Setup.exe)
+
+El workflow de build, además de la app, arma y **firma** un solo `Dessau-Setup.exe`
+(Inno Setup, `installer/dessau-monitor.iss`) que empaqueta la carpeta Release, corre
+`rustdesk.exe --silent-install` y escribe la config del agente con ACL SYSTEM. Ese
+paso **solo corre si están estos secrets en el repo del fork** (si faltan, se salta
+sin romper el build):
+
+- `CERT_PFX_BASE64` — el certificado de firma Dessau en base64 (el mismo de la suite).
+- `CERT_PFX_PASSWORD` — su contraseña.
+- `DESSAU_MONITOREO_SECRET` — el secreto del dispositivo (= `monitoreo_device_auth.secret`).
+- (opcional) variable `DESSAU_MONITOREO_URL` — si no, usa el default del `.iss`.
+
+El resultado es el artifact **`Dessau-Setup.exe`**. El `.iss` NO lleva secretos: se
+inyectan por entorno al compilar. Es UN instalador, sin `.ps1`.
+
 ## Recordatorio de arquitectura
 
 El agente NO se comunica con RustDesk: mide el escritorio con Win32 y reporta por
