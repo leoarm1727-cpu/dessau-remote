@@ -37,7 +37,10 @@ jobs:
       - name: Build
         shell: bash
         env: { VCPKG_ROOT: "${{ env.VCPKG_ROOT }}" }
-        run: python3 ./build.py --portable --flutter --hwcodec --vram --skip-portable-pack
+        # SIN --hwcodec/--vram: el codec por hardware (Intel Media SDK) no compila en
+        # CI (cl.exe error 2 en mfx_decode.cpp) y no lo necesitamos — RustDesk anda con
+        # codec por software y el agente de monitoreo no depende del codec.
+        run: python3 ./build.py --portable --flutter --skip-portable-pack
       - uses: actions/upload-artifact@v4
         with:
           name: dessau-rustdesk-windows
