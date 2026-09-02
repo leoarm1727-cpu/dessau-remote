@@ -48,40 +48,6 @@
     {
       "name": "libyuv",
       "host": false
-    },
-    {
-      "name": "mfx-dispatch",
-      "host": true,
-      "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
-    },
-    {
-      "name": "mfx-dispatch",
-      "host": false,
-      "platform": "((x86 | x64) & (android | linux)) | (windows & !uwp)"
-    },
-    {
-      "name": "ffmpeg",
-      "host": true,
-      "features": [
-        {
-          "name": "amf",
-          "platform": "(((windows & !arm) | linux) & static)"
-        },
-        {
-          "name": "nvcodec",
-          "platform": "(((windows & !arm) | linux) & static)"
-        },
-        {
-          "name": "qsv",
-          "platform": "(windows & !arm & static)"
-        }
-      ],
-      "platform": "((windows | (linux & !arm32) | osx) & static)"
-    },
-    {
-      "name": "ffmpeg",
-      "host": false,
-      "platform": "((android | ios | (linux & arm32)) & static)"
     }
   ],
   "vcpkg-configuration": {

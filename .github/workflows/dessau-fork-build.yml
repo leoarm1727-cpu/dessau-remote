@@ -11,7 +11,10 @@ env:
   LLVM_VERSION: "15.0.6"
   FLUTTER_VERSION: "3.24.5"
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  # Sin binary caching de GHA (evita depender de los tokens ACTIONS_CACHE_*): las libs
+  # se compilan desde fuente cada corrida, pero de forma confiable. Se puede reactivar
+  # ("clear;x-gha,readwrite") una vez que el build esté verde.
+  VCPKG_BINARY_SOURCES: "clear"
 jobs:
   build-windows:
     runs-on: windows-2022
@@ -31,7 +34,15 @@ jobs:
           git clone https://github.com/microsoft/vcpkg
           cd vcpkg && git checkout ${{ env.VCPKG_COMMIT_ID }}
           ./bootstrap-vcpkg.sh
-          echo "VCPKG_ROOT=$PWD" >> $GITHUB_ENV
+          VCPKG=$PWD
+          echo "VCPKG_ROOT=$VCPKG" >> $GITHUB_ENV
+          cd ..
+          # Instala las libs nativas del manifest (opus/aom/vpx/yuv/jpeg) en el triplet
+          # estático, DONDE los build scripts de los crates las buscan (installed/). Modo
+          # manifest: lee vcpkg.json y sus overlay-ports/triplets del root del repo.
+          # Sin este install, magnum-opus no encuentra opus/opus_multistream.h y bindgen
+          # panica (unwrap sobre Err(())).
+          "$VCPKG/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG/installed"
       - shell: bash
         run: pip3 install --upgrade pip && pip3 install requests
       - name: Build

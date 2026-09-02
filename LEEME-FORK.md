@@ -42,7 +42,7 @@ env:
   LLVM_VERSION: "15.0.6"
   FLUTTER_VERSION: "3.24.5"
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_BINARY_SOURCES: "clear"
 jobs:
   build-windows:
     runs-on: windows-2022
@@ -62,13 +62,19 @@ jobs:
           git clone https://github.com/microsoft/vcpkg
           cd vcpkg && git checkout ${{ env.VCPKG_COMMIT_ID }}
           ./bootstrap-vcpkg.sh
-          echo "VCPKG_ROOT=$PWD" >> $GITHUB_ENV
+          VCPKG=$PWD
+          echo "VCPKG_ROOT=$VCPKG" >> $GITHUB_ENV
+          cd ..
+          "$VCPKG/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG/installed"
       - shell: bash
         run: pip3 install --upgrade pip && pip3 install requests
       - name: Build
         shell: bash
         env: { VCPKG_ROOT: "${{ env.VCPKG_ROOT }}" }
-        run: python3 ./build.py --portable --flutter --hwcodec --vram --skip-portable-pack
+        # SIN --hwcodec/--vram: el codec por hardware (Intel Media SDK) no compila en
+        # CI (cl.exe error 2 en mfx_decode.cpp) y no lo necesitamos — RustDesk anda con
+        # codec por software y el agente de monitoreo no depende del codec.
+        run: python3 ./build.py --portable --flutter --skip-portable-pack
       - uses: actions/upload-artifact@v4
         with:
           name: dessau-rustdesk-windows
