@@ -52,7 +52,7 @@ jobs:
       - uses: KyleMayes/install-llvm-action@v2
         with: { version: "15.0.6" }
       - uses: dtolnay/rust-toolchain@stable
-        with: { toolchain: "1.75", targets: x86_64-pc-windows-msvc }
+        with: { toolchain: "1.75", targets: x86_64-pc-windows-msvc, components: rustfmt }
       - uses: Swatinem/rust-cache@v2
       - uses: subosito/flutter-action@v2
         with: { flutter-version: "3.24.5", channel: stable }
@@ -68,6 +68,14 @@ jobs:
           "$VCPKG/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG/installed"
       - shell: bash
         run: pip3 install --upgrade pip && pip3 install requests
+      - name: flutter_rust_bridge codegen
+        shell: bash
+        run: |
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features "uuid" --locked
+          mkdir -p flutter/macos/Runner
+          pushd flutter && flutter pub get && popd
+          flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
       - name: Build
         shell: bash
         env: { VCPKG_ROOT: "${{ env.VCPKG_ROOT }}" }
