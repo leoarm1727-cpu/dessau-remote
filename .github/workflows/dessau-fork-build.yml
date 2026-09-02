@@ -64,10 +64,11 @@ jobs:
         # CI (cl.exe error 2 en mfx_decode.cpp) y no lo necesitamos — RustDesk anda con
         # codec por software y el agente de monitoreo no depende del codec.
         run: python3 ./build.py --portable --flutter --skip-portable-pack
+      # La app Flutter NO es un solo .exe: es la carpeta Release (rustdesk.exe + DLLs +
+      # data/). Subimos la carpeta COMPLETA; el instalador (Inno) la empaqueta y corre
+      # `rustdesk.exe --silent-install` (que instala servicio + autoarranque).
       - uses: actions/upload-artifact@v4
         with:
           name: dessau-rustdesk-windows
-          path: |
-            **/*.exe
-            **/*.msi
-          if-no-files-found: warn
+          path: flutter/build/windows/x64/runner/Release
+          if-no-files-found: error

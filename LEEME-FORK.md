@@ -86,10 +86,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dessau-rustdesk-windows
-          path: |
-            **/*.exe
-            **/*.msi
-          if-no-files-found: warn
+          path: flutter/build/windows/x64/runner/Release
+          if-no-files-found: error
 ```
 
 ### 2. Subir el fork a un repo propio de GitHub
