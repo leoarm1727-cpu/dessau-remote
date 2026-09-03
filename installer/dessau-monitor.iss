@@ -68,7 +68,8 @@ OutputBaseFilename=Dessau-Setup
 Compression=lzma2/max
 SolidCompression=yes
 PrivilegesRequired=admin
-ArchitecturesInstall64Bit=x64compatible
+; Inno 6.4+ removió ArchitecturesInstall64Bit; ArchitecturesAllowed=x64compatible
+; ya pone el modo 64-bit en sistemas x64 (el runner trae Inno 6.7.1).
 ArchitecturesAllowed=x64compatible
 WizardStyle=modern
 ; --- Firma Authenticode (solo cuando se compila con /DFirmar en CI) -----------
