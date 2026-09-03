@@ -92,6 +92,16 @@ jobs:
           choco install innosetup --no-progress -y
           $app = "flutter\build\windows\x64\runner\Release"
           $env:DESSAU_APP_DIR = (Resolve-Path $app).Path
+          # Config del agente a un archivo que Inno empaqueta. Robusto: el secreto NO
+          # pasa por el preprocesador ni por Pascal, así ningún caracter especial ni
+          # salto de línea rompe la compilación del .iss. Trim quita espacios/saltos.
+          $cfgDir = "installer\_config"
+          New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+          $url = if ($env:DESSAU_MONITOREO_URL) { $env:DESSAU_MONITOREO_URL.Trim() } else { "https://pwjlxoladntvlnzhnqyi.supabase.co/functions/v1/monitoreo-actividad-device" }
+          $sec = $env:DESSAU_MONITOREO_SECRET.Trim()
+          $ak  = if ($env:DESSAU_MONITOREO_APIKEY) { $env:DESSAU_MONITOREO_APIKEY.Trim() } else { "" }
+          $cfg = "DESSAU_MONITOREO_URL=$url`r`nDESSAU_MONITOREO_SECRET=$sec`r`nDESSAU_MONITOREO_APIKEY=$ak`r`nDESSAU_MONITOREO_INTERVALO=60`r`n"
+          [IO.File]::WriteAllText("$cfgDir\config", $cfg, [Text.Encoding]::ASCII)
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $isccArgs = @("installer\dessau-monitor.iss")
           $pfx = $null

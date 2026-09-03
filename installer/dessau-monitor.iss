@@ -5,19 +5,17 @@
 ;    1. empaqueta la app Flutter compilada (rustdesk.exe + DLLs + data/) y corre
 ;       `rustdesk.exe --silent-install` (instala el fork como servicio con
 ;       autoarranque; el agente de monitoreo corre en el proceso --service, SYSTEM);
-;    2. escribe la config del agente (URL + secreto) en
-;       %ProgramData%\Dessau\monitoreo\config con ACL SOLO Administrators+SYSTEM;
+;    2. coloca la config del agente en %ProgramData%\Dessau\monitoreo\config con
+;       ACL SOLO Administrators+SYSTEM;
 ;    3. NO instala Gauzy y NO pide registro de usuario (desatendido).
 ;
 ;  El equipo se identifica por hostname + IP; el backend detecta si cambian.
 ;
-;  Se compila DENTRO del workflow del fork (dessau-fork-build.yml), reusando los
-;  secrets CERT_PFX_BASE64 / CERT_PFX_PASSWORD (firma) y DESSAU_MONITOREO_SECRET.
-;  Todo se inyecta por ENTORNO al compilar (NO queda en el repo):
-;      DESSAU_APP_DIR    = carpeta Release del build (rustdesk.exe + DLLs + data)
-;      DESSAU_MONITOREO_URL / DESSAU_MONITOREO_SECRET / DESSAU_MONITOREO_APIKEY
-;      ISCC.exe /DFirmar "/Sdessau=<cmd signtool>" installer\dessau-monitor.iss
-;  Sin /DFirmar compila sin firmar (prueba local).
+;  Se compila DENTRO del workflow del fork (dessau-fork-build.yml). El archivo de
+;  config (con el secreto) lo ESCRIBE el workflow en `installer\_config\config`
+;  (pwsh, robusto a cualquier valor) y este .iss solo lo empaqueta — el secreto NO
+;  pasa por el preprocesador ni por Pascal. La firma es opcional (/DFirmar en CI).
+;  DESSAU_APP_DIR = carpeta Release del build. Todo se inyecta por entorno.
 ;
 ;  ⚠️ Antes de distribuir: avisar a los trabajadores (Ley 29733) y publicar el
 ;     código del fork (AGPL). Ver LEEME-FORK.md.
@@ -26,25 +24,6 @@
 #define AppNombre "Dessau Soporte y Productividad"
 #define AppVersion "1.0.0"
 #define AppPublisher "Dessau S&Z S.A."
-
-; --- Inyectados por entorno al compilar (con defaults sensatos) ---------------
-#ifndef Url
-  #define Url GetEnv("DESSAU_MONITOREO_URL")
-#endif
-#if Url == ""
-  #define Url "https://pwjlxoladntvlnzhnqyi.supabase.co/functions/v1/monitoreo-actividad-device"
-#endif
-
-#ifndef Secret
-  #define Secret GetEnv("DESSAU_MONITOREO_SECRET")
-#endif
-#if Secret == ""
-  #error Falta DESSAU_MONITOREO_SECRET: definilo por entorno antes de compilar (= monitoreo_device_auth.secret).
-#endif
-
-#ifndef ApiKey
-  #define ApiKey GetEnv("DESSAU_MONITOREO_APIKEY")
-#endif
 
 ; Carpeta con la app Flutter YA compilada: rustdesk.exe + DLLs + data/.
 #ifndef AppDir
@@ -68,11 +47,8 @@ OutputBaseFilename=Dessau-Setup
 Compression=lzma2/max
 SolidCompression=yes
 PrivilegesRequired=admin
-; Inno 6.4+ removió ArchitecturesInstall64Bit; ArchitecturesAllowed=x64compatible
-; ya pone el modo 64-bit en sistemas x64 (el runner trae Inno 6.7.1).
 ArchitecturesAllowed=x64compatible
 WizardStyle=modern
-; --- Firma Authenticode (solo cuando se compila con /DFirmar en CI) -----------
 #ifdef Firmar
 SignTool=dessau
 SignedUninstaller=yes
@@ -81,13 +57,15 @@ SignedUninstaller=yes
 [Languages]
 Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
 
+[Dirs]
+Name: "{commonappdata}\Dessau\monitoreo"
+
 [Files]
 ; La app Flutter completa (rustdesk.exe + DLLs + data/). El fork se auto-instala con
 ; --silent-install (abajo), que copia todo a su ubicación real y crea el servicio.
 Source: "{#AppDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-[Dirs]
-Name: "{commonappdata}\Dessau\monitoreo"
+; El config del agente (lo escribió el workflow con el secreto). ACL restrictiva abajo.
+Source: "_config\config"; DestDir: "{commonappdata}\Dessau\monitoreo"; Flags: ignoreversion
 
 [UninstallRun]
 Filename: "{app}\rustdesk.exe"; Parameters: "--uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "DessauForkUninstall"
@@ -96,21 +74,6 @@ Filename: "{app}\rustdesk.exe"; Parameters: "--uninstall"; Flags: runhidden wait
 Type: filesandordirs; Name: "{commonappdata}\Dessau\monitoreo"
 
 [Code]
-procedure EscribirConfig();
-var
-  Dir, Archivo, Contenido: string;
-begin
-  Dir := ExpandConstant('{commonappdata}\Dessau\monitoreo');
-  ForceDirectories(Dir);
-  Archivo := Dir + '\config';
-  Contenido :=
-    'DESSAU_MONITOREO_URL={#Url}'      + #13#10 +
-    'DESSAU_MONITOREO_SECRET={#Secret}' + #13#10 +
-    'DESSAU_MONITOREO_APIKEY={#ApiKey}' + #13#10 +
-    'DESSAU_MONITOREO_INTERVALO=60'     + #13#10;
-  SaveStringToFile(Archivo, Contenido, False);
-end;
-
 procedure BloquearACL();
 var
   Dir: string;
@@ -140,9 +103,8 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    // Orden: 1) config + ACL ANTES de instalar/arrancar el servicio, para que el
-    // primer latido del agente ya tenga endpoint y secreto; 2) instalar el fork.
-    EscribirConfig();
+    // El config ya quedó copiado en ssInstall. Bloquear su ACL ANTES de instalar/
+    // arrancar el servicio, para que el primer latido del agente ya lo lea protegido.
     BloquearACL();
     InstalarFork();
   end;
