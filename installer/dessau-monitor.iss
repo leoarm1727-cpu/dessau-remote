@@ -87,11 +87,24 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
     // El config (solo la URL) ya quedó copiado en ssInstall, legible por el usuario.
     // No se bloquea con ACL: no hay secreto que proteger (es por-dispositivo, runtime).
+    //
+    // 🔑 icacls /reset SIEMPRE, aunque la carpeta sea nueva: una versión ANTERIOR de
+    // este instalador SÍ bloqueaba el ACL (protegía un secreto compartido). Si la
+    // carpeta ya existía de esa versión vieja, Inno NO le toca los permisos al
+    // sobrescribir el archivo -> el candado viejo queda puesto sobre el config nuevo
+    // y el agente (corre como usuario normal en --tray) no puede leer la URL y queda
+    // inerte en silencio. Verificado en PC726 (2026-09-04): "sin DESSAU_MONITOREO_URL
+    // — agente inerte" hasta resetear el ACL a mano.
+    Exec(ExpandConstant('{sys}\icacls.exe'),
+         ExpandConstant('"{commonappdata}\Dessau\monitoreo" /reset /T'),
+         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     InstalarFork();
   end;
 end;
