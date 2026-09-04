@@ -124,6 +124,10 @@ winapi = { version = "0.3", features = [
     "wingdi",       # indicador visible de monitoreo (GDI: fondo/fuente/color del banner)
     "libloaderapi", # indicador visible de monitoreo (GetModuleHandleW); ya venía vía scrap, se hace explícito
     "sysinfoapi",   # GetTickCount para calcular la inactividad (monitoreo.rs)
+    "processthreadsapi", # OpenProcess: nombre del .exe de la ventana en primer plano (monitoreo.rs)
+    "handleapi",         # CloseHandle del handle de proceso
+    "winnt",             # PROCESS_QUERY_LIMITED_INFORMATION
+    "winbase",           # QueryFullProcessImageNameW: ruta del ejecutable
 ] }
 windows = { version = "0.61", features = [
     "Win32",

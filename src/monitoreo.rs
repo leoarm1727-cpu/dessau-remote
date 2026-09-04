@@ -201,6 +201,62 @@ fn ventana_primer_plano() -> String {
     }
 }
 
+/// Nombre del ejecutable (.exe) de la ventana en primer plano, en minúsculas
+/// (ej. "code.exe"). Es lo que clasifica el catálogo `monitoreo_apps` (compara
+/// `app.toLowerCase() === patron`, donde los patrones son "code.exe", "chrome.exe"…).
+/// Sin esto el índice de productividad queda en 0% (todo "Sin categoría").
+fn app_primer_plano() -> Option<String> {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winbase::QueryFullProcessImageNameW;
+    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+    use winapi::um::winuser::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf: Vec<u16> = vec![0u16; 512];
+        let mut size: u32 = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(h);
+        if ok == 0 || size == 0 {
+            return None;
+        }
+        let full = String::from_utf16_lossy(&buf[..size as usize]);
+        let base = full
+            .rsplit(|c| c == '\\' || c == '/')
+            .next()
+            .unwrap_or(&full)
+            .trim()
+            .to_lowercase();
+        if base.is_empty() {
+            None
+        } else {
+            Some(base)
+        }
+    }
+}
+
+/// Nombre amigable para mostrar en el panel ("code.exe" -> "Code").
+fn nombre_amigable_app(exe: &str) -> String {
+    let base = exe.strip_suffix(".exe").unwrap_or(exe);
+    let mut chars = base.chars();
+    match chars.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+        None => base.to_string(),
+    }
+}
+
 fn hostname() -> String {
     hbb_common::whoami::fallible::hostname().unwrap_or_else(|_| "desconocido".into())
 }
@@ -261,14 +317,16 @@ struct Abierto {
     fin: chrono::DateTime<chrono::Utc>,
     estado: &'static str,
     titulo: Option<String>,
+    app: Option<String>,
 }
 
 fn cerrar(a: Abierto) -> serde_json::Value {
+    let app_nombre = a.app.as_deref().map(nombre_amigable_app);
     serde_json::json!({
         "inicio": a.inicio.to_rfc3339(),
         "fin": a.fin.to_rfc3339(),
-        "app": serde_json::Value::Null,       // Fase 2: nombre del .exe
-        "appNombre": serde_json::Value::Null,
+        "app": a.app,                          // ej. "code.exe" (clasifica el catálogo)
+        "appNombre": app_nombre,               // ej. "Code" (para mostrar en el panel)
         "titulo": a.titulo,
         "url": serde_json::Value::Null,        // Fase 2: URL del navegador
         "estado": a.estado,
@@ -385,6 +443,9 @@ pub fn ejecutar() {
         if activo && pol.seguimiento {
             let idle = inactividad_ms();
             let estado: &'static str = if idle >= pol.idle_seg * 1000 { "ocioso" } else { "activo" };
+            // El .exe se captura siempre que haya seguimiento (es la base de la
+            // clasificación de productividad); el título va gateado por capturar_titulos.
+            let app = app_primer_plano();
             let titulo = if pol.capturar_titulos {
                 let t = ventana_primer_plano();
                 if t.is_empty() { None } else { Some(t) }
@@ -392,7 +453,9 @@ pub fn ejecutar() {
                 None
             };
             let ahora = chrono::Utc::now();
-            let extender = matches!(&abierto, Some(a) if a.estado == estado);
+            // Se corta el intervalo cuando cambia el estado O la app, así el panel
+            // reparte el tiempo por programa (no lo agrupa todo bajo la última app).
+            let extender = matches!(&abierto, Some(a) if a.estado == estado && a.app == app);
             if extender {
                 if let Some(a) = abierto.as_mut() {
                     a.fin = ahora;
@@ -402,7 +465,7 @@ pub fn ejecutar() {
                 if let Some(a) = abierto.take() {
                     buf.push(cerrar(a));
                 }
-                abierto = Some(Abierto { inicio: ahora, fin: ahora, estado, titulo });
+                abierto = Some(Abierto { inicio: ahora, fin: ahora, estado, titulo, app });
             }
         }
 
