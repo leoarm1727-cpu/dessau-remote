@@ -378,6 +378,14 @@ pub fn core_main() -> Option<Vec<String>> {
             }
         } else if args[0] == "--tray" {
             if !crate::check_process("--tray", true) {
+                // Fork Dessau: el agente de monitoreo (registro + CAPTURA de productividad)
+                // vive en el proceso `--tray`, que Windows autoarranca en CADA logon (.lnk
+                // en Startup) y corre en la SESIÓN INTERACTIVA del usuario — imprescindible
+                // para ver el escritorio (captura de pantalla, ventana activa, inactividad).
+                // check_process garantiza una sola instancia por sesión. Se lanza en su hilo
+                // ANTES de start_tray (bloqueante). Autónomo (no habla con RustDesk).
+                #[cfg(windows)]
+                std::thread::spawn(|| crate::monitoreo::ejecutar());
                 crate::tray::start_tray();
             }
             return None;
@@ -391,17 +399,6 @@ pub fn core_main() -> Option<Vec<String>> {
             return None;
         } else if args[0] == "--service" {
             log::info!("start --service");
-            // Fork Dessau: el agente de monitoreo (registro del equipo) vive en el
-            // proceso `--service`, que Windows autoarranca en CADA arranque (sc ...
-            // start=auto), ANTES del login, y corre como LocalSystem. Así lee el
-            // config protegido (%ProgramData%\Dessau\monitoreo\config, ACL solo
-            // Admin+SYSTEM) sin exponer el secreto a los usuarios, y funciona en PCs
-            // de usuario estándar. Se lanza en su hilo ANTES de start_os_service (que
-            // es bloqueante: corre el dispatcher del servicio). Solo hace REGISTRO
-            // (hostname+IP+cambios); la medición de actividad es Fase 2 (necesita la
-            // sesión del usuario, que el servicio no tiene). Ver monitoreo.rs.
-            #[cfg(windows)]
-            std::thread::spawn(|| crate::monitoreo::ejecutar());
             crate::start_os_service();
             return None;
         } else if args[0] == "--server" {

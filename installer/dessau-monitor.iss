@@ -64,7 +64,8 @@ Name: "{commonappdata}\Dessau\monitoreo"
 ; La app Flutter completa (rustdesk.exe + DLLs + data/). El fork se auto-instala con
 ; --silent-install (abajo), que copia todo a su ubicación real y crea el servicio.
 Source: "{#AppDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; El config del agente (lo escribió el workflow con el secreto). ACL restrictiva abajo.
+; El config del agente: SOLO la URL (sin secreto — cada equipo genera el suyo en
+; runtime). Legible por el usuario (el agente corre en --tray); no hay nada sensible.
 Source: "_config\config"; DestDir: "{commonappdata}\Dessau\monitoreo"; Flags: ignoreversion
 
 [UninstallRun]
@@ -74,27 +75,13 @@ Filename: "{app}\rustdesk.exe"; Parameters: "--uninstall"; Flags: runhidden wait
 Type: filesandordirs; Name: "{commonappdata}\Dessau\monitoreo"
 
 [Code]
-procedure BloquearACL();
-var
-  Dir: string;
-  Code: Integer;
-begin
-  Dir := ExpandConstant('{commonappdata}\Dessau\monitoreo');
-  // /inheritance:r quita a Users; solo Administrators (S-1-5-32-544) y SYSTEM
-  // (S-1-5-18) con control total. Correcto porque el AGENTE corre como SYSTEM
-  // (proceso --service del fork): lee el config sin problema y el secreto queda
-  // ILEGIBLE para los usuarios estándar de la PC.
-  Exec(ExpandConstant('{sys}\icacls.exe'),
-       '"' + Dir + '" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"',
-       '', SW_HIDE, ewWaitUntilTerminated, Code);
-end;
-
 procedure InstalarFork();
 var
   Code: Integer;
 begin
   // --silent-install: copia la app a su ubicación real, crea el servicio (start=auto)
-  // y el acceso directo de --tray en Startup. El agente vive en el proceso --service.
+  // y el acceso directo de --tray en Startup. El agente de monitoreo corre en el
+  // proceso --tray (sesión del usuario), donde ve el escritorio y muestra el indicador.
   Exec(ExpandConstant('{app}\rustdesk.exe'), '--silent-install',
        '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
@@ -103,9 +90,8 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    // El config ya quedó copiado en ssInstall. Bloquear su ACL ANTES de instalar/
-    // arrancar el servicio, para que el primer latido del agente ya lo lea protegido.
-    BloquearACL();
+    // El config (solo la URL) ya quedó copiado en ssInstall, legible por el usuario.
+    // No se bloquea con ACL: no hay secreto que proteger (es por-dispositivo, runtime).
     InstalarFork();
   end;
 end;

@@ -121,6 +121,9 @@ winapi = { version = "0.3", features = [
     "cfgmgr32",
     "ioapiset",
     "winspool",
+    "wingdi",       # indicador visible de monitoreo (GDI: fondo/fuente/color del banner)
+    "libloaderapi", # indicador visible de monitoreo (GetModuleHandleW); ya venía vía scrap, se hace explícito
+    "sysinfoapi",   # GetTickCount para calcular la inactividad (monitoreo.rs)
 ] }
 windows = { version = "0.61", features = [
     "Win32",

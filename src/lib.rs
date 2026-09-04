@@ -44,8 +44,16 @@ pub mod core_main;
 mod custom_server;
 // Agente de monitoreo de productividad (fork Dessau) — solo Windows. Ver
 // src/monitoreo.rs. ⚠️ Esta modificación pone el fork bajo obligación AGPL §13.
+// TRANSPARENTE (Ley 29733): monitoreo_aviso = consentimiento, monitoreo_indicador
+// = señal visible permanente, monitoreo_captura = screenshot. Nada corre sin ambos.
 #[cfg(windows)]
 pub mod monitoreo;
+#[cfg(windows)]
+pub mod monitoreo_aviso;
+#[cfg(windows)]
+pub mod monitoreo_captura;
+#[cfg(windows)]
+pub mod monitoreo_indicador;
 mod lang;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod port_forward;

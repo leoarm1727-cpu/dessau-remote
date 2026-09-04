@@ -74,33 +74,27 @@ jobs:
           if-no-files-found: error
 
       # Arma el instalador único Dessau-Setup.exe (Inno) y lo FIRMA si están los secrets
-      # del certificado. Desacoplado: con DESSAU_MONITOREO_SECRET solo, arma un instalador
-      # SIN firmar (testeable); con CERT_PFX_BASE64 + CERT_PFX_PASSWORD además, lo firma
-      # (rustdesk.exe + instalador + desinstalador). Sin DESSAU_MONITOREO_SECRET se salta.
+      # del certificado. El config lleva SOLO la URL (sin secreto: cada equipo genera el
+      # suyo en 1ra corrida). Sin firma es testeable; con CERT_PFX_BASE64 + CERT_PFX_PASSWORD
+      # se firma (rustdesk.exe + instalador + desinstalador).
       - name: Instalador Inno (firma si hay cert)
         shell: pwsh
         env:
           CERT_PFX_BASE64: ${{ secrets.CERT_PFX_BASE64 }}
           CERT_PFX_PASSWORD: ${{ secrets.CERT_PFX_PASSWORD }}
-          DESSAU_MONITOREO_SECRET: ${{ secrets.DESSAU_MONITOREO_SECRET }}
           DESSAU_MONITOREO_URL: ${{ vars.DESSAU_MONITOREO_URL }}
+          DESSAU_MONITOREO_APIKEY: ${{ secrets.DESSAU_MONITOREO_APIKEY }}
         run: |
-          if (-not $env:DESSAU_MONITOREO_SECRET) {
-            Write-Host "== Falta DESSAU_MONITOREO_SECRET: no armo el instalador (el artifact de la app queda igual). =="
-            exit 0
-          }
           choco install innosetup --no-progress -y
           $app = "flutter\build\windows\x64\runner\Release"
           $env:DESSAU_APP_DIR = (Resolve-Path $app).Path
-          # Config del agente a un archivo que Inno empaqueta. Robusto: el secreto NO
-          # pasa por el preprocesador ni por Pascal, así ningún caracter especial ni
-          # salto de línea rompe la compilación del .iss. Trim quita espacios/saltos.
+          # Config del agente que Inno empaqueta: SOLO la URL (y apikey opcional). El
+          # secreto NO va acá — cada equipo genera el suyo por-dispositivo en runtime.
           $cfgDir = "installer\_config"
           New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
           $url = if ($env:DESSAU_MONITOREO_URL) { $env:DESSAU_MONITOREO_URL.Trim() } else { "https://pwjlxoladntvlnzhnqyi.supabase.co/functions/v1/monitoreo-actividad-device" }
-          $sec = $env:DESSAU_MONITOREO_SECRET.Trim()
           $ak  = if ($env:DESSAU_MONITOREO_APIKEY) { $env:DESSAU_MONITOREO_APIKEY.Trim() } else { "" }
-          $cfg = "DESSAU_MONITOREO_URL=$url`r`nDESSAU_MONITOREO_SECRET=$sec`r`nDESSAU_MONITOREO_APIKEY=$ak`r`nDESSAU_MONITOREO_INTERVALO=60`r`n"
+          $cfg = "DESSAU_MONITOREO_URL=$url`r`nDESSAU_MONITOREO_APIKEY=$ak`r`nDESSAU_MONITOREO_INTERVALO=60`r`n"
           [IO.File]::WriteAllText("$cfgDir\config", $cfg, [Text.Encoding]::ASCII)
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           $isccArgs = @("installer\dessau-monitor.iss")
