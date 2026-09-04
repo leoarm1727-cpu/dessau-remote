@@ -996,12 +996,23 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
-    if is_custom_client() {
-        return;
-    }
-    let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
-    if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
-        std::thread::spawn(move || allow_err!(do_check_software_update()));
+    // 🔴 Fork Dessau: DESACTIVADO a propósito. `do_check_software_update()` consulta
+    // `https://api.rustdesk.com/version/latest` — el RustDesk OFICIAL, no este fork.
+    // Nuestra versión (crate::VERSION) queda fija en la del último snapshot, así que
+    // esa comparación SIEMPRE da "hay una versión nueva" y muestra un banner que
+    // ofrece instalar el RustDesk oficial encima — lo que borraría el agente de
+    // monitoreo. El hot-update de ESTE fork es un mecanismo propio y deliberado
+    // (Dessau), no este. Ver LEEME-FORK.md.
+    return;
+    #[allow(unreachable_code)]
+    {
+        if is_custom_client() {
+            return;
+        }
+        let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
+        if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
+            std::thread::spawn(move || allow_err!(do_check_software_update()));
+        }
     }
 }
 
