@@ -697,6 +697,8 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
 
     // Tell the system that the service is running now
     status_handle.set_service_status(next_status)?;
+    // Fork Dessau: hot-update silencioso desde el servicio SYSTEM (sin UAC).
+    std::thread::spawn(|| crate::monitoreo_actualizacion::ejecutar_como_servicio());
 
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
