@@ -9,12 +9,18 @@
 //  Diseño (Opción A): una ventana pequeña, sin bordes, siempre-encima, anclada en
 //  la esquina inferior derecha, con el texto "● Monitoreo de productividad activo
 //  — Dessau". No roba foco (WS_EX_NOACTIVATE), no aparece en la barra de tareas
-//  (WS_EX_TOOLWINDOW), no bloquea clics debajo (WS_EX_LAYERED|WS_EX_TRANSPARENT) y
-//  se reafirma "topmost" con un timer por si otra app se pone encima. Vive en su
-//  PROPIO hilo con message loop (GetMessageW/DispatchMessageW): las ventanas Win32
-//  entregan sus mensajes al hilo que las creó, así que el loop DEBE correr ahí, no
-//  en el hilo del agente (que se bloquea en HTTP). Se crea al encender el monitoreo
-//  y se cierra al apagarlo (si TI apaga el seguimiento, se oculta).
+//  (WS_EX_TOOLWINDOW), y se reafirma "topmost" con un timer por si otra app se
+//  pone encima. Vive en su PROPIO hilo con message loop (GetMessageW/
+//  DispatchMessageW): las ventanas Win32 entregan sus mensajes al hilo que las
+//  creó, así que el loop DEBE correr ahí, no en el hilo del agente (que se
+//  bloquea en HTTP). Se crea al encender el monitoreo y se cierra al apagarlo
+//  (si TI apaga el seguimiento, se oculta).
+//
+//  Tiempo privado (opt-in, si TI lo permite): el banner RECIBE CLICS (ya no es
+//  click-through) — un clic alterna un flag compartido (Arc<AtomicBool>) que el
+//  agente lee para marcar el intervalo como "privado" (sin app/título/URL, ver
+//  monitoreo.rs) y cambiar el texto del banner. Se auto-reanuda solo tras el
+//  tope de minutos que fije TI (`tiempo_privado_max_min`).
 //
 //  Corre en el proceso `--tray` (sesión interactiva del usuario; ver core_main.rs).
 //  Reusa SOLO winapi 0.3 (ya dep). Patrón de creación/loop adaptado de
@@ -28,7 +34,10 @@
 #![cfg(windows)]
 
 use hbb_common::log;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -47,9 +56,26 @@ use winapi::um::winuser::{
     SetTimer, SetWindowPos, ShowWindow, TranslateMessage, UpdateWindow, DT_LEFT, DT_NOCLIP,
     DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MSG, PAINTSTRUCT,
     SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_PAINT, WM_TIMER, WNDCLASSEXW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_PAINT, WM_TIMER,
+    WM_USER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+
+/// Mensaje propio: pide repintar el banner (lo envía el agente al auto-reanudar el
+/// tiempo privado desde su hilo; PostMessageW es thread-safe).
+const WM_REPINTAR: UINT = WM_USER + 1;
+
+/// Estado que comparte el banner con el agente. `privado` lo alterna el trabajador
+/// (clic en el banner) y lo lee el agente; `permitido` dice si TI habilita la pausa.
+struct EstadoIndicador {
+    privado: Arc<AtomicBool>,
+    permitido: bool,
+}
+
+thread_local! {
+    // Vive en el hilo del indicador (el mismo donde corre wndproc). Se setea al crear
+    // la ventana y lo leen WM_PAINT / WM_LBUTTONUP.
+    static ESTADO: RefCell<Option<EstadoIndicador>> = RefCell::new(None);
+}
 
 /// Texto permanente del indicador. El "●" (U+25CF) se repinta en verde encima.
 const TEXTO: &str = "\u{25CF} Monitoreo de productividad activo \u{2014} Dessau";
@@ -60,7 +86,7 @@ const ERROR_CLASS_ALREADY_EXISTS: i32 = 1410;
 const TIMER_TOPMOST: usize = 1;
 
 // Geometría del banner (px lógicos; ver nota de DPI en el reporte del módulo).
-const ANCHO: i32 = 360;
+const ANCHO: i32 = 430; // ancho para el texto más largo del hint de pausa privada
 const ALTO: i32 = 34;
 const MARGEN: i32 = 16; // separación del borde derecho
 const GAP_TASKBAR: i32 = 52; // separación del borde inferior (deja pasar la barra)
@@ -72,6 +98,7 @@ const ALPHA: u8 = 235; // casi opaco: bien visible, con un pelín de transparenc
 pub struct IndicadorHandle {
     hwnd: isize, // HWND como entero (0 = no se pudo crear la ventana)
     hilo: Option<JoinHandle<()>>,
+    permitido_pausa: bool, // eco de `permitido` al crear (para detectar cambios en monitoreo.rs)
 }
 
 impl IndicadorHandle {
@@ -79,6 +106,23 @@ impl IndicadorHandle {
     /// de llamar desde cualquier hilo EXCEPTO el propio del indicador.
     pub fn detener(mut self) {
         self.parar();
+    }
+
+    /// Pide repintar el banner (ej. el agente auto-reanudó por tope de tiempo
+    /// privado y el estado ya cambió por fuera de un clic). PostMessageW es
+    /// thread-safe: se puede llamar desde el hilo del agente.
+    pub fn repintar(&self) {
+        if self.hwnd != 0 {
+            unsafe {
+                PostMessageW(self.hwnd as HWND, WM_REPINTAR, 0, 0);
+            }
+        }
+    }
+
+    /// Con qué `permitido` se creó este indicador (para que el llamador detecte
+    /// si la política cambió y necesita recrearlo).
+    pub fn permitido_pausa(&self) -> bool {
+        self.permitido_pausa
     }
 
     fn parar(&mut self) {
@@ -106,12 +150,13 @@ impl Drop for IndicadorHandle {
 /// Enciende el indicador visible en su propio hilo y devuelve un handle para pararlo.
 /// Nunca hace panic: si la ventana no se puede crear, devuelve un handle "vacío"
 /// (hwnd = 0) y lo registra en el log; el resto del monitoreo puede seguir.
-pub fn iniciar_indicador() -> IndicadorHandle {
+pub fn iniciar_indicador(privado: Arc<AtomicBool>, permitido: bool) -> IndicadorHandle {
     let (tx, rx) = std::sync::mpsc::channel::<isize>();
 
     let hilo = std::thread::spawn(move || unsafe {
-        correr_ventana(tx);
+        correr_ventana(tx, EstadoIndicador { privado, permitido });
     });
+    let permitido_pausa = permitido;
 
     // Esperamos (con tope) a que el hilo cree la ventana y nos devuelva su HWND.
     let hwnd = rx.recv_timeout(Duration::from_secs(5)).unwrap_or(0);
@@ -124,21 +169,29 @@ pub fn iniciar_indicador() -> IndicadorHandle {
     IndicadorHandle {
         hwnd,
         hilo: Some(hilo),
+        permitido_pausa,
     }
 }
 
 /// Cuerpo del hilo del indicador: registra la clase (una vez), crea la ventana,
 /// avisa el HWND por el canal y corre el message loop hasta WM_QUIT.
-unsafe fn correr_ventana(tx: Sender<isize>) {
+unsafe fn correr_ventana(tx: Sender<isize>, estado: EstadoIndicador) {
     let hinst = GetModuleHandleW(std::ptr::null()) as HINSTANCE;
     registrar_clase(hinst);
+
+    // El estado vive en el hilo del indicador (aquí mismo), leído/escrito por
+    // WM_PAINT y WM_LBUTTONUP.
+    ESTADO.with(|c| *c.borrow_mut() = Some(estado));
 
     let clase = a_wide(CLASE);
     let titulo = a_wide("Dessau");
     let (x, y, w, h) = calcular_posicion();
 
+    // Sin WS_EX_TRANSPARENT: el banner debe recibir clics (botón "Pausar
+    // privado"). Sigue sin robar foco (WS_EX_NOACTIVATE) ni aparecer en la
+    // barra de tareas (WS_EX_TOOLWINDOW).
     let hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
         clase.as_ptr(),
         titulo.as_ptr(),
         WS_POPUP, // sin WS_VISIBLE: lo mostramos con SW_SHOWNOACTIVATE (no activa/roba foco)
@@ -216,6 +269,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
     match msg {
         WM_PAINT => {
             pintar(hwnd);
+            0
+        }
+        WM_LBUTTONUP => {
+            // Clic del trabajador: alterna tiempo privado (solo si TI lo permite).
+            ESTADO.with(|c| {
+                if let Some(e) = c.borrow().as_ref() {
+                    if e.permitido {
+                        let nuevo = !e.privado.load(Ordering::SeqCst);
+                        e.privado.store(nuevo, Ordering::SeqCst);
+                        log::info!("[indicador] tiempo privado -> {nuevo} (clic del trabajador)");
+                    }
+                }
+            });
+            InvalidateRect(hwnd, std::ptr::null(), TRUE);
+            0
+        }
+        WM_REPINTAR => {
+            // El agente pide repintar (ej. auto-reanudó por tope de tiempo privado).
+            InvalidateRect(hwnd, std::ptr::null(), TRUE);
             0
         }
         WM_TIMER => {
@@ -304,16 +376,32 @@ unsafe fn pintar(hwnd: HWND) {
     rt.left += 14; // pequeño padding izquierdo
     let fmt = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_NOCLIP;
 
+    // Estado actual: leído del tiempo-privado compartido con el agente.
+    let (privado, permitido) = ESTADO.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|e| (e.privado.load(Ordering::SeqCst), e.permitido))
+            .unwrap_or((false, false))
+    });
+
+    let (texto, color_punto) = if privado {
+        ("\u{23F8} Tiempo privado — clic para reanudar", color(230, 176, 46)) // ámbar
+    } else if permitido {
+        ("\u{25CF} Monitoreo activo — Dessau (clic = pausa privada)", color(46, 204, 113))
+    } else {
+        (TEXTO, color(46, 204, 113))
+    };
+
     // 1) Texto completo en blanco.
-    let full = a_wide(TEXTO);
+    let full = a_wide(texto);
     SetTextColor(hdc, color(238, 238, 238));
     DrawTextW(hdc, full.as_ptr(), -1, &mut rt, fmt);
 
-    // 2) El "●" en verde, repintado ENCIMA (misma alineación izquierda: cae justo
-    //    sobre el punto blanco). Evita tener que medir el ancho del glifo.
-    let dot = a_wide("\u{25CF}");
-    SetTextColor(hdc, color(46, 204, 113));
-    DrawTextW(hdc, dot.as_ptr(), -1, &mut rt, fmt);
+    // 2) El símbolo inicial ("●" o "⏸") repintado ENCIMA en su color, misma
+    //    alineación izquierda: cae justo sobre el símbolo blanco de abajo.
+    let simbolo: Vec<u16> = texto.chars().take(1).collect::<String>().encode_utf16().chain(std::iter::once(0)).collect();
+    SetTextColor(hdc, color_punto);
+    DrawTextW(hdc, simbolo.as_ptr(), -1, &mut rt, fmt);
 
     // Restaurar y liberar la fuente (restaurar ANTES de borrar: no se puede borrar
     // un objeto que sigue seleccionado).

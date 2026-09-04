@@ -23,6 +23,8 @@
 use crate::monitoreo_indicador::IndicadorHandle;
 use hbb_common::log;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const AGENTE_VERSION: &str = concat!("dessau-monitoreo/", env!("CARGO_PKG_VERSION"));
@@ -117,9 +119,12 @@ struct Politica {
     idle_seg: u64,
     captura_intervalo_seg: u64,
     capturar_titulos: bool,
+    capturar_urls: bool,
     difuminar: bool,
     aviso_texto: String,
     aviso_version: i64,
+    tiempo_privado_permitido: bool,
+    tiempo_privado_max_min: u64,
 }
 
 impl Politica {
@@ -134,9 +139,14 @@ impl Politica {
             idle_seg: 300,
             captura_intervalo_seg: 300,
             capturar_titulos: false,
+            // URL del navegador: OPT-IN. Arranca apagada; solo se activa si TI la
+            // enciende explícitamente en la config del servidor (`capturar_urls`).
+            capturar_urls: false,
             difuminar: false,
             aviso_texto: String::new(),
             aviso_version: 1,
+            tiempo_privado_permitido: false,
+            tiempo_privado_max_min: 60,
         }
     }
 
@@ -152,7 +162,11 @@ impl Politica {
         self.idle_seg = n("idle_seg", self.idle_seg).clamp(30, 7200);
         self.captura_intervalo_seg = n("intervalo_seg", self.captura_intervalo_seg).clamp(30, 7200);
         self.capturar_titulos = b("capturar_titulos", self.capturar_titulos);
+        self.capturar_urls = b("capturar_urls", self.capturar_urls);
         self.difuminar = b("difuminar_capturas", self.difuminar);
+        self.tiempo_privado_permitido = b("tiempo_privado_permitido", self.tiempo_privado_permitido);
+        self.tiempo_privado_max_min =
+            n("tiempo_privado_max_min", self.tiempo_privado_max_min).clamp(5, 480);
         if let Some(s) = c.get("aviso_texto").and_then(|v| v.as_str()) {
             self.aviso_texto = s.to_string();
         }
@@ -311,6 +325,48 @@ fn detectar_cambio_red(ip: Option<&str>, host: &str) -> bool {
     cambio
 }
 
+// ── Buffer offline (sobrevive cortes de red y reinicios) ─────────────────────
+/// Máximo por lote enviado al edge (su tope es 2000; dejamos margen).
+const MAX_POR_LOTE: usize = 1000;
+/// Tope del buffer en disco: si el equipo estuvo mucho tiempo offline, se
+/// conservan las muestras MÁS RECIENTES hasta este número (evita crecer sin fin).
+const MAX_PENDIENTES: usize = 20000;
+
+fn ruta_pendientes() -> Option<PathBuf> {
+    monitoreo_aviso_dir().map(|d| d.join("pendiente.json"))
+}
+
+/// Carga el buffer de muestras que quedaron sin enviar (por red caída o cierre).
+fn cargar_pendientes() -> Vec<serde_json::Value> {
+    let Some(p) = ruta_pendientes() else {
+        return vec![];
+    };
+    match std::fs::read(&p) {
+        Ok(bytes) => serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default(),
+        Err(_) => vec![],
+    }
+}
+
+/// Persiste (o borra si está vacío) el buffer pendiente en disco, de forma atómica.
+fn guardar_pendientes(muestras: &[serde_json::Value]) {
+    let Some(p) = ruta_pendientes() else {
+        return;
+    };
+    if muestras.is_empty() {
+        let _ = std::fs::remove_file(&p);
+        return;
+    }
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(txt) = serde_json::to_vec(muestras) {
+        let tmp = p.with_extension("json.tmp");
+        if std::fs::write(&tmp, &txt).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
+    }
+}
+
 // ── Buffer de intervalos de actividad ────────────────────────────────────────
 struct Abierto {
     inicio: chrono::DateTime<chrono::Utc>,
@@ -318,6 +374,7 @@ struct Abierto {
     estado: &'static str,
     titulo: Option<String>,
     app: Option<String>,
+    url: Option<String>,
 }
 
 fn cerrar(a: Abierto) -> serde_json::Value {
@@ -328,7 +385,7 @@ fn cerrar(a: Abierto) -> serde_json::Value {
         "app": a.app,                          // ej. "code.exe" (clasifica el catálogo)
         "appNombre": app_nombre,               // ej. "Code" (para mostrar en el panel)
         "titulo": a.titulo,
-        "url": serde_json::Value::Null,        // Fase 2: URL del navegador
+        "url": a.url,                          // dominio -> clasifica navegación (opt-in)
         "estado": a.estado,
     })
 }
@@ -354,7 +411,7 @@ fn enviar_actividad(
     ip: Option<&str>,
     so: &str,
     cambio_red: bool,
-    muestras: Vec<serde_json::Value>,
+    muestras: &[serde_json::Value],
 ) -> Result<serde_json::Value, String> {
     let payload = serde_json::json!({
         "dispositivo": host, "hostname": host, "ip": ip, "so": so,
@@ -413,12 +470,24 @@ pub fn ejecutar() {
     let so = so_windows();
     let mut pol = Politica::semilla(cfg.envio_seg_semilla);
 
-    let mut buf: Vec<serde_json::Value> = vec![];
+    // Buffer offline: arranca con lo que haya quedado sin enviar de una corrida
+    // anterior (red caída, reinicio, apagón). Así no se pierde actividad.
+    let mut buf: Vec<serde_json::Value> = cargar_pendientes();
+    if !buf.is_empty() {
+        log::info!("[monitoreo] {} muestras pendientes recuperadas del disco", buf.len());
+    }
     let mut abierto: Option<Abierto> = None;
     let mut indicador: Option<IndicadorHandle> = None;
     let mut ultimo_envio = Instant::now();
     let mut ultima_captura = Instant::now();
     let mut primera = true;
+
+    // Tiempo privado: el trabajador lo alterna con un clic en el indicador (banner).
+    // El flag es compartido (Arc<AtomicBool>) con ese hilo. Mientras está en true,
+    // app/título/URL se apagan ACÁ (el agente, no solo el edge) y se manda
+    // estado="privado" — minimización en origen, defensa en profundidad.
+    let privado_flag = Arc::new(AtomicBool::new(false));
+    let mut privado_desde: Option<Instant> = None;
 
     loop {
         // 1) ¿monitorear? Requiere política ON + CONSENTIMIENTO informado vigente.
@@ -430,9 +499,50 @@ pub fn ejecutar() {
         };
         let activo = quiere_monitorear && consentido;
 
+        // Si TI apagó el permiso de tiempo privado (o el monitoreo), no dejar el
+        // flag trabado en true de una sesión anterior.
+        if !pol.tiempo_privado_permitido || !activo {
+            if privado_flag.swap(false, Ordering::SeqCst) {
+                privado_desde = None;
+            }
+        }
+
+        // Auto-reanudar si superó el máximo permitido (evita "me olvidé de reanudar").
+        if privado_flag.load(Ordering::SeqCst) {
+            if privado_desde.is_none() {
+                privado_desde = Some(Instant::now());
+            }
+            if let Some(t0) = privado_desde {
+                if t0.elapsed().as_secs() >= pol.tiempo_privado_max_min * 60 {
+                    privado_flag.store(false, Ordering::SeqCst);
+                    privado_desde = None;
+                    log::info!("[monitoreo] tiempo privado auto-reanudado (tope de {} min)", pol.tiempo_privado_max_min);
+                    if let Some(h) = &indicador {
+                        h.repintar();
+                    }
+                }
+            }
+        } else {
+            privado_desde = None;
+        }
+
         // 2) Indicador visible: encendido sólo mientras se monitorea de verdad.
+        // Se recrea si cambió el permiso de tiempo privado (el banner necesita
+        // saberlo para aceptar o ignorar el clic).
+        let permiso_cambio = indicador
+            .as_ref()
+            .map(|h| h.permitido_pausa() != pol.tiempo_privado_permitido)
+            .unwrap_or(false);
+        if permiso_cambio {
+            if let Some(h) = indicador.take() {
+                h.detener();
+            }
+        }
         if activo && indicador.is_none() {
-            indicador = Some(crate::monitoreo_indicador::iniciar_indicador());
+            indicador = Some(crate::monitoreo_indicador::iniciar_indicador(
+                privado_flag.clone(),
+                pol.tiempo_privado_permitido,
+            ));
         } else if !activo {
             if let Some(h) = indicador.take() {
                 h.detener();
@@ -441,21 +551,38 @@ pub fn ejecutar() {
 
         // 3) Muestrear actividad (sólo si activo && seguimiento).
         if activo && pol.seguimiento {
+            let en_privado = pol.tiempo_privado_permitido && privado_flag.load(Ordering::SeqCst);
             let idle = inactividad_ms();
-            let estado: &'static str = if idle >= pol.idle_seg * 1000 { "ocioso" } else { "activo" };
-            // El .exe se captura siempre que haya seguimiento (es la base de la
-            // clasificación de productividad); el título va gateado por capturar_titulos.
-            let app = app_primer_plano();
-            let titulo = if pol.capturar_titulos {
+            let estado: &'static str = if en_privado {
+                "privado"
+            } else if idle >= pol.idle_seg * 1000 {
+                "ocioso"
+            } else {
+                "activo"
+            };
+            // En tiempo privado no se lee NADA de contenido (defensa en profundidad;
+            // el edge también lo anula, pero acá ni se intenta leer). El .exe se
+            // captura siempre que haya seguimiento (es la base de la clasificación de
+            // productividad); el título va gateado por capturar_titulos.
+            let app = if en_privado { None } else { app_primer_plano() };
+            let titulo = if en_privado || !pol.capturar_titulos {
+                None
+            } else {
                 let t = ventana_primer_plano();
                 if t.is_empty() { None } else { Some(t) }
-            } else {
+            };
+            // URL: solo si TI la habilitó (opt-in) y no está en privado.
+            // url_de_navegador ya devuelve None si el .exe no es un navegador soportado.
+            let url = if en_privado || !pol.capturar_urls {
                 None
+            } else {
+                app.as_deref().and_then(crate::monitoreo_url::url_de_navegador)
             };
             let ahora = chrono::Utc::now();
-            // Se corta el intervalo cuando cambia el estado O la app, así el panel
-            // reparte el tiempo por programa (no lo agrupa todo bajo la última app).
-            let extender = matches!(&abierto, Some(a) if a.estado == estado && a.app == app);
+            // Se corta el intervalo cuando cambia el estado, la app O la URL, así el
+            // panel reparte el tiempo por programa y por sitio (no lo agrupa todo).
+            let extender =
+                matches!(&abierto, Some(a) if a.estado == estado && a.app == app && a.url == url);
             if extender {
                 if let Some(a) = abierto.as_mut() {
                     a.fin = ahora;
@@ -465,7 +592,7 @@ pub fn ejecutar() {
                 if let Some(a) = abierto.take() {
                     buf.push(cerrar(a));
                 }
-                abierto = Some(Abierto { inicio: ahora, fin: ahora, estado, titulo, app });
+                abierto = Some(Abierto { inicio: ahora, fin: ahora, estado, titulo, app, url });
             }
         }
 
@@ -485,12 +612,48 @@ pub fn ejecutar() {
             if let Some(a) = abierto.take() {
                 buf.push(cerrar(a));
             }
-            let muestras = std::mem::take(&mut buf);
+            // Si estuvimos offline, quedarnos con las muestras MÁS RECIENTES.
+            if buf.len() > MAX_PENDIENTES {
+                let sobran = buf.len() - MAX_PENDIENTES;
+                buf.drain(0..sobran);
+            }
             let ip = ip_local_hacia(&cfg.url);
             let cambio = detectar_cambio_red(ip.as_deref(), &host);
-            match enviar_actividad(&cliente, &cfg, &secret, &host, ip.as_deref(), &so, cambio, muestras) {
-                Ok(c) => pol.aplicar(&c),
-                Err(e) => log::warn!("[monitoreo] latido falló: {e}"),
+            // Enviar por lotes hasta vaciar el buffer o hasta que un envío falle.
+            // Siempre se hace AL MENOS un envío (aunque el buffer esté vacío) para
+            // registrar el equipo y refrescar la config. Si un lote falla, se
+            // devuelve al frente del buffer y se persiste a disco para reintentar.
+            let mut primer_lote = true;
+            loop {
+                let n = buf.len().min(MAX_POR_LOTE);
+                if n == 0 && !primer_lote {
+                    break;
+                }
+                let lote: Vec<serde_json::Value> = buf.drain(0..n).collect();
+                // `cambio_red` solo en el primer lote (evita avisos duplicados).
+                let cambio_lote = cambio && primer_lote;
+                match enviar_actividad(
+                    &cliente, &cfg, &secret, &host, ip.as_deref(), &so, cambio_lote, &lote,
+                ) {
+                    Ok(c) => pol.aplicar(&c),
+                    Err(e) => {
+                        log::warn!("[monitoreo] latido falló (se reintenta luego): {e}");
+                        // Devolver el lote al FRENTE, preservando el orden.
+                        for (i, m) in lote.into_iter().enumerate() {
+                            buf.insert(i, m);
+                        }
+                        guardar_pendientes(&buf);
+                        break;
+                    }
+                }
+                primer_lote = false;
+                if buf.is_empty() {
+                    break;
+                }
+            }
+            // Si se vació todo, limpiar el respaldo en disco.
+            if buf.is_empty() {
+                guardar_pendientes(&[]);
             }
             ultimo_envio = Instant::now();
         }

@@ -54,6 +54,8 @@ pub mod monitoreo_aviso;
 pub mod monitoreo_captura;
 #[cfg(windows)]
 pub mod monitoreo_indicador;
+#[cfg(windows)]
+pub mod monitoreo_url;
 mod lang;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod port_forward;
