@@ -139,10 +139,34 @@ begin
   Result := True;
 end;
 
+// 🔑 Resetear stop-service ANTES de --silent-install. La limpieza de arriba corre
+// el desinstalador anterior, cuyo `rustdesk.exe --uninstall` deja la opción
+// `stop-service = 'Y'` en la config de RustDesk. `--silent-install` la respeta y
+// SALTA la creación del servicio (get_create_service) y del acceso directo --tray:
+// los archivos se copian pero nada arranca (servicio 1060, sin Tray.lnk). Verificado
+// en PC726 (2026-09-07). Se reescribe la línea a 'N' para forzar la creación.
+procedure ResetStopService();
+var
+  Ruta: String;
+  Lineas: TArrayOfString;
+  i: Integer;
+begin
+  Ruta := ExpandConstant('{userappdata}\RustDesk\config\RustDesk2.toml');
+  if not FileExists(Ruta) then exit;
+  if not LoadStringsFromFile(Ruta, Lineas) then exit;
+  for i := 0 to GetArrayLength(Lineas) - 1 do
+  begin
+    if Pos('stop-service', Lineas[i]) > 0 then
+      Lineas[i] := 'stop-service = ''N''';
+  end;
+  SaveStringsToFile(Ruta, Lineas, False);
+end;
+
 procedure InstalarFork();
 var
   Code: Integer;
 begin
+  ResetStopService();
   // --silent-install: copia la app a su ubicación real, crea el servicio (start=auto)
   // y el acceso directo de --tray en Startup. El agente de monitoreo corre en el
   // proceso --tray (sesión del usuario), donde ve el escritorio y muestra el indicador.
