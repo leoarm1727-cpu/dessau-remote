@@ -138,7 +138,7 @@ jobs:
           $b1 = @{ accion = "iniciar"; version = $env:VERSION } | ConvertTo-Json
           $r1 = Invoke-RestMethod -Method Post -Uri $fn -Headers $h -Body $b1
           if (-not $r1.signedUrl) { throw "sin signedUrl" }
-          $upUrl = "$proj/storage/v1$($r1.signedUrl)"
+          $upUrl = $r1.signedUrl
           $bytes = [IO.File]::ReadAllBytes($exe)
           Invoke-RestMethod -Method Put -Uri $upUrl -Headers @{ "Content-Type" = "application/octet-stream" } -Body $bytes
           $b3 = @{ accion = "confirmar"; version = $env:VERSION; sha256 = $sha; notas = "CI run ${{ github.run_number }}" } | ConvertTo-Json
