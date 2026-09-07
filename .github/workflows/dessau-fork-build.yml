@@ -59,7 +59,9 @@ jobs:
           flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
       - name: Build
         shell: bash
-        env: { VCPKG_ROOT: "${{ env.VCPKG_ROOT }}" }
+        env:
+          VCPKG_ROOT: "${{ env.VCPKG_ROOT }}"
+          DESSAU_INSTALADOR_VERSION: "1.5.0.${{ github.run_number }}"
         # SIN --hwcodec/--vram: el codec por hardware (Intel Media SDK) no compila en
         # CI (cl.exe error 2 en mfx_decode.cpp) y no lo necesitamos — RustDesk anda con
         # codec por software y el agente de monitoreo no depende del codec.
@@ -120,3 +122,25 @@ jobs:
           name: Dessau-Setup
           path: installer/Output/Dessau-Setup.exe
           if-no-files-found: error
+      - name: Publicar release (hot-update)
+        if: ${{ hashFiles('installer/Output/Dessau-Setup.exe') != '' }}
+        shell: pwsh
+        env:
+          CI_PUBLISH_SECRET: ${{ secrets.CI_PUBLISH_SECRET }}
+          VERSION: "1.5.0.${{ github.run_number }}"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe  = (Resolve-Path "installer/Output/Dessau-Setup.exe").Path
+          $sha  = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          $proj = "https://pwjlxoladntvlnzhnqyi.supabase.co"
+          $fn   = "$proj/functions/v1/monitoreo-publicar-release"
+          $h    = @{ "x-ci-secret" = $env:CI_PUBLISH_SECRET; "Content-Type" = "application/json" }
+          $b1 = @{ accion = "iniciar"; version = $env:VERSION } | ConvertTo-Json
+          $r1 = Invoke-RestMethod -Method Post -Uri $fn -Headers $h -Body $b1
+          if (-not $r1.signedUrl) { throw "sin signedUrl" }
+          $upUrl = "$proj/storage/v1$($r1.signedUrl)"
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          Invoke-RestMethod -Method Put -Uri $upUrl -Headers @{ "Content-Type" = "application/octet-stream" } -Body $bytes
+          $b3 = @{ accion = "confirmar"; version = $env:VERSION; sha256 = $sha; notas = "CI run ${{ github.run_number }}" } | ConvertTo-Json
+          $r3 = Invoke-RestMethod -Method Post -Uri $fn -Headers $h -Body $b3
+          Write-Host "Publicada release $($r3.version) ($sha)"
