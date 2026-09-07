@@ -75,6 +75,70 @@ Filename: "{app}\rustdesk.exe"; Parameters: "--uninstall"; Flags: runhidden wait
 Type: filesandordirs; Name: "{commonappdata}\Dessau\monitoreo"
 
 [Code]
+// ── Limpieza de instalación anterior (evita incompatibilidades) ─────────────
+// Pedido: "que instalar siempre desinstale y limpie lo del anterior instalador".
+// Reinstalar SOBRE una versión previa sin desinstalarla primero es exactamente
+// lo que causó el bug del ACL bloqueado (2026-09-04): un candado de una versión
+// vieja quedaba puesto sobre el config nuevo porque Inno no resetea permisos de
+// una carpeta que ya existía. Ahora, ANTES de copiar un solo archivo, se corre
+// el desinstalador de la versión anterior (si existe) — que a su vez ejecuta SU
+// PROPIO [UninstallRun] (rustdesk.exe --uninstall: para el servicio, borra el
+// acceso directo de Startup) y su [UninstallDelete] (borra %ProgramData%\Dessau\
+// monitoreo completo, incluida cualquier config/ACL vieja) — así cada instalación
+// arranca de cero, sin importar qué versión hubiera antes.
+function ObtenerRutaDesinstaladorAnterior(): String;
+var
+  Cmd: String;
+begin
+  Result := '';
+  // {#SetupSetting("AppId")} expande al GUID de [Setup] (sin duplicar la llave);
+  // es la MISMA clave donde Inno registra el desinstalador de cualquier versión
+  // anterior de este fork (mismo AppId = mismo producto, no toca otros programas).
+  if RegQueryStringValue(HKLM,
+       'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1',
+       'UninstallString', Cmd) then
+  begin
+    Cmd := Trim(Cmd);
+    // El valor viene entre comillas: "C:\...\unins000.exe". Se las quitamos.
+    if (Length(Cmd) >= 2) and (Cmd[1] = '"') then
+    begin
+      Delete(Cmd, 1, 1);
+      if Pos('"', Cmd) > 0 then
+        Cmd := Copy(Cmd, 1, Pos('"', Cmd) - 1);
+    end;
+    Result := Cmd;
+  end;
+end;
+
+procedure LimpiarInstalacionAnterior();
+var
+  RutaDesinstalador: String;
+  ResultCode: Integer;
+begin
+  RutaDesinstalador := ObtenerRutaDesinstaladorAnterior();
+  if (RutaDesinstalador <> '') and FileExists(RutaDesinstalador) then
+  begin
+    Exec(RutaDesinstalador, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '',
+         SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+  // Red de seguridad ADICIONAL, best-effort (se ignoran errores de cada Exec):
+  // por si el desinstalador de arriba no existía (copia manual del instalador
+  // sin pasar por Windows, registro corrupto) o dejó algo a medias. Nunca
+  // bloquea la instalación si alguno de estos pasos falla.
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM rustdesk.exe /T', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\sc.exe'), 'stop RustDesk', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\sc.exe'), 'delete RustDesk', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  LimpiarInstalacionAnterior();
+  Result := True;
+end;
+
 procedure InstalarFork();
 var
   Code: Integer;
