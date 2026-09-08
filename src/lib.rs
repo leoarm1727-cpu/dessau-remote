@@ -54,6 +54,10 @@ pub mod monitoreo_aviso;
 pub mod monitoreo_captura;
 #[cfg(windows)]
 pub mod monitoreo_indicador;
+// Contadores AGREGADOS de interaccion (Reglamento RI-TI-001): tres totales por
+// intervalo, jamas la tecla ni el contenido. Ver src/monitoreo_interaccion.rs.
+#[cfg(windows)]
+pub mod monitoreo_interaccion;
 #[cfg(windows)]
 pub mod monitoreo_url;
 #[cfg(windows)]
