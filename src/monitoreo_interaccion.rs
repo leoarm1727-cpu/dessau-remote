@@ -14,9 +14,15 @@
 //      NUNCA se lee (solo `Flags`, para distinguir bajar de soltar). Si alguien
 //      agrega una lectura de VKey a este archivo, está violando el Reglamento.
 //    • Guardar contenido, texto, portapapeles ni selección: no se toca nada de eso.
-//    • Guardar COORDENADAS del puntero: de RAWMOUSE solo se compara `lLastX`/
-//      `lLastY` contra cero para saber SI hubo movimiento; los valores no se
-//      almacenan, no se acumulan y no se envían.
+//    • Guardar —ni siquiera leer— COORDENADAS del puntero. Con un mouse normal,
+//      `lLastX`/`lLastY` son un DESPLAZAMIENTO y solo se comparan contra cero. Con
+//      un dispositivo ABSOLUTO (RDP, VM, tableta, táctil) esos campos serían una
+//      POSICIÓN, así que ahí NO se los mira: el movimiento se deduce de que el
+//      reporte no traiga ningún botón (`usButtonFlags == 0`), que es lo que
+//      distingue un movimiento de un clic quieto. Nunca se guarda una posición.
+//      Esta rama subcuenta el caso «clic mientras se mueve», y esa dirección es
+//      la que favorece al trabajador: menos movimiento contado = más fácil que se
+//      dispare la compuerta que le descarta tiempo que no lo representa.
 //    • Guardar el EVENTO individual o su marca de tiempo: no hay traza, solo
 //      acumuladores. La cadencia por evento es rasgo biométrico conductual y por
 //      eso está prohibida en el propio Reglamento.
@@ -40,8 +46,9 @@
 #![cfg(windows)]
 
 use hbb_common::log;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -53,7 +60,8 @@ use winapi::um::winuser::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetRawInputData, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterRawInputDevices,
     TranslateMessage, HWND_MESSAGE, MSG, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK,
-    RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RI_KEY_BREAK, RI_MOUSE_BUTTON_4_DOWN,
+    MOUSE_MOVE_ABSOLUTE, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE, RI_KEY_BREAK,
+    RI_MOUSE_BUTTON_4_DOWN,
     RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_DOWN,
     RI_MOUSE_RIGHT_BUTTON_DOWN, WM_CLOSE, WM_DESTROY, WM_INPUT, WNDCLASSEXW,
 };
@@ -106,11 +114,22 @@ pub fn tomar() -> Contadores {
 /// Handle para DETENER el contador. Mismo patrón que `IndicadorHandle`: mientras
 /// no haya monitoreo activo, este objeto no existe y no se cuenta nada.
 pub struct ContadorHandle {
-    hwnd: isize, // HWND como entero (0 = no se pudo crear la ventana)
+    /// HWND como entero, COMPARTIDO con el hilo (0 = todavía/nunca creado). Es un
+    /// atómico y no una copia porque el hilo puede crear la ventana DESPUÉS de que
+    /// venza el handshake: con una copia en cero, `parar()` no mandaría el WM_CLOSE
+    /// y el `join()` colgaría el agente para siempre.
+    hwnd: Arc<AtomicI64>,
     hilo: Option<JoinHandle<()>>,
 }
 
 impl ContadorHandle {
+    /// ¿El contador está midiendo de verdad? Si es `false`, el agente NO debe
+    /// reportar ceros: debe reportar «no hay dato» (null), porque cero significa
+    /// «medí y no hubo interacción» y dispararía la compuerta contra el trabajador.
+    pub fn activo(&self) -> bool {
+        self.hwnd.load(Ordering::SeqCst) != 0
+    }
+
     /// Cierra la ventana solo-mensajes, espera al hilo y descarta lo que quedara
     /// sin leer (al apagar el monitoreo no se arrastra nada al próximo encendido).
     pub fn detener(mut self) {
@@ -119,9 +138,13 @@ impl ContadorHandle {
 
     fn parar(&mut self) {
         if let Some(hilo) = self.hilo.take() {
-            if self.hwnd != 0 {
+            // Se relee el HWND: si la ventana se creó tarde (handshake vencido),
+            // acá ya está y el hilo recibe su WM_CLOSE. Si vale 0, el hilo terminó
+            // solo por fallo de creación o de registro, y el join no bloquea.
+            let hwnd = self.hwnd.load(Ordering::SeqCst);
+            if hwnd != 0 {
                 unsafe {
-                    PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
+                    PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0);
                 }
             }
             let _ = hilo.join();
@@ -136,19 +159,34 @@ impl Drop for ContadorHandle {
     }
 }
 
-/// Enciende el contador en su propio hilo. Nunca hace panic: si la ventana o el
-/// registro de raw input fallan, devuelve un handle vacío y los contadores quedan
-/// en cero (y el servidor lo verá como "sin interacción reportada", no como cero).
+/// Enciende el contador en su propio hilo. Nunca hace panic —ni siquiera si el
+/// sistema no puede crear el hilo: se usa `Builder::spawn`, que devuelve `Result`,
+/// porque el release del fork es `panic = 'abort'` y un panic acá tumbaría el
+/// proceso `--tray` entero (con él, el indicador visible de la Ley 29733)—. Si algo
+/// falla devuelve un handle con `activo() == false`, y el agente debe entonces
+/// reportar NULL, nunca ceros.
 pub fn iniciar_contador() -> ContadorHandle {
     let (tx, rx) = std::sync::mpsc::channel::<isize>();
+    let hwnd = Arc::new(AtomicI64::new(0));
+    let hwnd_hilo = hwnd.clone();
 
-    let hilo = std::thread::spawn(move || unsafe {
-        correr_ventana(tx);
-    });
+    let hilo = match std::thread::Builder::new()
+        .name("dessau-interaccion".into())
+        .spawn(move || unsafe {
+            correr_ventana(tx, hwnd_hilo);
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("[interaccion] no se pudo crear el hilo del contador: {e}");
+            return ContadorHandle { hwnd, hilo: None };
+        }
+    };
 
-    let hwnd = rx.recv_timeout(Duration::from_secs(5)).unwrap_or(0);
-    if hwnd == 0 {
-        log::warn!("[interaccion] no se pudo iniciar el contador de interacción");
+    // El handshake solo sirve para loguear a tiempo: la fuente de verdad del HWND
+    // es el atómico, que el hilo escribe apenas crea la ventana.
+    let _ = rx.recv_timeout(Duration::from_secs(5));
+    if hwnd.load(Ordering::SeqCst) == 0 {
+        log::warn!("[interaccion] el contador de interacción no arrancó: se reportará NULL");
     } else {
         log::info!("[interaccion] contadores agregados ACTIVOS (solo totales)");
     }
@@ -160,7 +198,7 @@ pub fn iniciar_contador() -> ContadorHandle {
 }
 
 /// Hilo del contador: clase + ventana solo-mensajes + raw input + message loop.
-unsafe fn correr_ventana(tx: Sender<isize>) {
+unsafe fn correr_ventana(tx: Sender<isize>, hwnd_compartido: Arc<AtomicI64>) {
     let hinst = GetModuleHandleW(std::ptr::null()) as HINSTANCE;
     registrar_clase(hinst);
 
@@ -186,6 +224,9 @@ unsafe fn correr_ventana(tx: Sender<isize>) {
         let _ = tx.send(0);
         return;
     }
+    // Publicado ANTES de registrar raw input: si el registro falla se vuelve a 0
+    // abajo, y mientras tanto `parar()` ya sabe a qué ventana mandarle el WM_CLOSE.
+    hwnd_compartido.store(hwnd as i64, Ordering::SeqCst);
 
     // RIDEV_INPUTSINK: recibimos el evento aunque la ventana no tenga el foco
     // (es una ventana invisible: nunca lo tiene). Usage page 0x01 (genérico),
@@ -211,6 +252,7 @@ unsafe fn correr_ventana(tx: Sender<isize>) {
     );
     if ok == 0 {
         log::warn!("[interaccion] RegisterRawInputDevices falló; no habrá contadores");
+        hwnd_compartido.store(0, Ordering::SeqCst);
         DestroyWindow(hwnd);
         let _ = tx.send(0);
         return;
@@ -225,6 +267,8 @@ unsafe fn correr_ventana(tx: Sender<isize>) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    // La ventana ya no existe: nadie debe creer que el contador sigue midiendo.
+    hwnd_compartido.store(0, Ordering::SeqCst);
 }
 
 unsafe fn registrar_clase(hinst: HINSTANCE) {
@@ -258,10 +302,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
     }
 }
 
-/// Núcleo de la medición. Toda la lectura del evento está acá y son ocho líneas:
-/// del teclado solo se mira `Flags` (bajar/soltar) y del mouse solo `usButtonFlags`
-/// (¿bajó algún botón?) y si `lLastX/lLastY` son distintos de cero (¿se movió?).
-/// NO se lee `VKey`, NO se lee `MakeCode`, NO se guardan coordenadas.
+/// Núcleo de la medición. Toda la lectura del evento está acá, y es corta a
+/// propósito: del teclado solo se mira `Flags` (bajar/soltar); del mouse, solo
+/// `usFlags` (¿el dispositivo reporta posición o desplazamiento?), `usButtonFlags`
+/// (¿bajó algún botón? — no cuál) y, únicamente en el caso de desplazamiento, si
+/// `lLastX/lLastY` son distintos de cero. NO se lee `VKey`, NO se lee `MakeCode`,
+/// y NUNCA se lee ni se guarda una posición del puntero.
 unsafe fn contar(lp: LPARAM) {
     let mut raw: RAWINPUT = std::mem::zeroed();
     let mut tam = std::mem::size_of::<RAWINPUT>() as u32;
@@ -291,8 +337,20 @@ unsafe fn contar(lp: LPARAM) {
             if (m.usButtonFlags & BOTON_ABAJO) != 0 {
                 CLICS.fetch_add(1, Ordering::Relaxed);
             }
-            // ¿Hubo movimiento? Se compara contra cero y se descarta el valor.
-            if m.lLastX != 0 || m.lLastY != 0 {
+            // ¿Hubo movimiento? En el mouse NORMAL, lLastX/lLastY son un
+            // DESPLAZAMIENTO y basta compararlos contra cero. En un dispositivo
+            // ABSOLUTO (RDP, VM, tableta, táctil) esos campos son una POSICIÓN, y
+            // mirarlos sería leer la coordenada del puntero, que el Reglamento
+            // prohíbe RECOLECTAR (no solo guardar). Ahí se usa la única señal que
+            // no es coordenada: un reporte sin ningún botón es un reporte de
+            // movimiento; el clic quieto trae botón y no cuenta. Subcuenta el clic
+            // hecho mientras se mueve, y esa dirección favorece al trabajador.
+            let se_movio = if (m.usFlags & MOUSE_MOVE_ABSOLUTE) != 0 {
+                m.usButtonFlags == 0
+            } else {
+                m.lLastX != 0 || m.lLastY != 0
+            };
+            if se_movio {
                 let seg = (GetTickCount() as u64) / 1000;
                 // Un segundo se cuenta UNA vez, por más eventos que lleguen.
                 if ULTIMO_SEG_MOV.swap(seg, Ordering::Relaxed) != seg {
