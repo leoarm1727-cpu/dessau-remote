@@ -7,20 +7,21 @@
 //  empleado está informado y ve, en todo momento, que el seguimiento está encendido.
 //
 //  Diseño (Opción A): una ventana pequeña, sin bordes, siempre-encima, anclada en
-//  la esquina inferior derecha, con el texto "● Monitoreo de productividad activo
-//  — Dessau". No roba foco (WS_EX_NOACTIVATE), no aparece en la barra de tareas
-//  (WS_EX_TOOLWINDOW), y se reafirma "topmost" con un timer por si otra app se
-//  pone encima. Vive en su PROPIO hilo con message loop (GetMessageW/
-//  DispatchMessageW): las ventanas Win32 entregan sus mensajes al hilo que las
-//  creó, así que el loop DEBE correr ahí, no en el hilo del agente (que se
+//  la esquina inferior derecha, con la identidad Dessau S&Z (azul institucional
+//  #0F3C63, franja teal #08998B, marca en dorado #F0BE1E) y el texto "● Monitoreo
+//  de productividad activo — DESSAU S&Z". No roba foco (WS_EX_NOACTIVATE), no
+//  aparece en la barra de tareas (WS_EX_TOOLWINDOW), y se reafirma "topmost" con un
+//  timer por si otra app se pone encima. Vive en su PROPIO hilo con message loop
+//  (GetMessageW/DispatchMessageW): las ventanas Win32 entregan sus mensajes al hilo
+//  que las creó, así que el loop DEBE correr ahí, no en el hilo del agente (que se
 //  bloquea en HTTP). Se crea al encender el monitoreo y se cierra al apagarlo
 //  (si TI apaga el seguimiento, se oculta).
 //
-//  Tiempo privado (opt-in, si TI lo permite): el banner RECIBE CLICS (ya no es
-//  click-through) — un clic alterna un flag compartido (Arc<AtomicBool>) que el
-//  agente lee para marcar el intervalo como "privado" (sin app/título/URL, ver
-//  monitoreo.rs) y cambiar el texto del banner. Se auto-reanuda solo tras el
-//  tope de minutos que fije TI (`tiempo_privado_max_min`).
+//  NO SE PUEDE PAUSAR: el banner es CLICK-THROUGH (WS_EX_TRANSPARENT). No recibe
+//  clics, no se mueve, no se cierra y ya no ofrece "tiempo privado" — mientras el
+//  monitoreo esté encendido el aviso está a la vista y el trabajador no puede
+//  apagarlo. Encender o apagar el monitoreo es potestad de TI (política del
+//  servidor), no del equipo.
 //
 //  Corre en el proceso `--tray` (sesión interactiva del usuario; ver core_main.rs).
 //  Reusa SOLO winapi 0.3 (ya dep). Patrón de creación/loop adaptado de
@@ -34,71 +35,76 @@
 #![cfg(windows)]
 
 use hbb_common::log;
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use winapi::shared::minwindef::{HINSTANCE, LPARAM, LRESULT, TRUE, UINT, WPARAM};
-use winapi::shared::windef::{HBRUSH, HDC, HFONT, HGDIOBJ, HWND, RECT};
+use winapi::shared::windef::{HBRUSH, HDC, HFONT, HGDIOBJ, HWND, RECT, SIZE};
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::wingdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, SelectObject, SetBkMode, SetTextColor,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE,
-    FW_SEMIBOLD, OUT_TT_PRECIS, TRANSPARENT,
+    CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, GetTextExtentPoint32W,
+    SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, FF_DONTCARE, FW_SEMIBOLD, OUT_TT_PRECIS, TRANSPARENT,
 };
 use winapi::um::winuser::{
     BeginPaint, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, DrawTextW,
-    EndPaint, FillRect, GetClientRect, GetMessageW, GetSystemMetrics, InvalidateRect, KillTimer,
-    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetLayeredWindowAttributes,
-    SetTimer, SetWindowPos, ShowWindow, TranslateMessage, UpdateWindow, DT_LEFT, DT_NOCLIP,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MSG, PAINTSTRUCT,
-    SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_PAINT, WM_TIMER,
-    WM_USER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    EndPaint, FillRect, GetClientRect, GetDC, GetMessageW, GetSystemMetrics, InvalidateRect,
+    KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, ReleaseDC,
+    SetLayeredWindowAttributes, SetTimer, SetWindowPos, SetWindowRgn, ShowWindow, TranslateMessage,
+    UpdateWindow, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HWND_TOPMOST,
+    IDC_ARROW, LWA_ALPHA, MSG, PAINTSTRUCT, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_PAINT,
+    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-/// Mensaje propio: pide repintar el banner (lo envía el agente al auto-reanudar el
-/// tiempo privado desde su hilo; PostMessageW es thread-safe).
-const WM_REPINTAR: UINT = WM_USER + 1;
-
-/// Estado que comparte el banner con el agente. `privado` lo alterna el trabajador
-/// (clic en el banner) y lo lee el agente; `permitido` dice si TI habilita la pausa.
-struct EstadoIndicador {
-    privado: Arc<AtomicBool>,
-    permitido: bool,
-}
-
-thread_local! {
-    // Vive en el hilo del indicador (el mismo donde corre wndproc). Se setea al crear
-    // la ventana y lo leen WM_PAINT / WM_LBUTTONUP.
-    static ESTADO: RefCell<Option<EstadoIndicador>> = RefCell::new(None);
-}
-
-/// Texto permanente del indicador. El "●" (U+25CF) se repinta en verde encima.
-const TEXTO: &str = "\u{25CF} Monitoreo de productividad activo \u{2014} Dessau";
 /// Nombre de la clase de ventana. Se registra UNA vez por proceso (ver `registrar_clase`).
 const CLASE: &str = "DessauMonitoreoIndicador";
 /// ERROR_CLASS_ALREADY_EXISTS: si reiniciamos el indicador la clase ya está registrada.
 const ERROR_CLASS_ALREADY_EXISTS: i32 = 1410;
 const TIMER_TOPMOST: usize = 1;
 
+// Paleta institucional Dessau S&Z (Manual de Marca; la misma de la app web).
+const NAVY: (u8, u8, u8) = (15, 60, 99); // #0F3C63 azul corporativo (fondo)
+const TEAL: (u8, u8, u8) = (8, 153, 139); // #08998B acento (franja y testigo ●)
+const GOLD: (u8, u8, u8) = (240, 190, 30); // #F0BE1E dorado (marca)
+const BLANCO: (u8, u8, u8) = (255, 255, 255);
+const TENUE: (u8, u8, u8) = (125, 158, 186); // separador, azul claro apagado
+
+/// Texto del banner por tramos: (texto, color, separación antes del tramo).
+/// El "●" (U+25CF) en teal es el testigo de "monitoreo encendido".
+const TRAMOS: [(&str, (u8, u8, u8), i32); 4] = [
+    ("\u{25CF}", TEAL, 0),
+    ("Monitoreo de productividad activo", BLANCO, 9),
+    ("\u{2014}", TENUE, 10),
+    ("DESSAU S&Z", GOLD, 10),
+];
+
 // Geometría del banner (px lógicos; ver nota de DPI en el reporte del módulo).
-const ANCHO: i32 = 430; // ancho para el texto más largo del hint de pausa privada
 const ALTO: i32 = 34;
+const BARRA: i32 = 5; // franja teal pegada al borde izquierdo
+const PAD: i32 = 14; // separación entre la franja y el texto
+const PAD_DER: i32 = 16; // aire a la derecha del último tramo
+const ANCHO_FALLBACK: i32 = 430; // si no se puede medir el texto
 const MARGEN: i32 = 16; // separación del borde derecho
 const GAP_TASKBAR: i32 = 52; // separación del borde inferior (deja pasar la barra)
+const RADIO: i32 = 12; // esquinas redondeadas (como la app)
 const ALPHA: u8 = 235; // casi opaco: bien visible, con un pelín de transparencia
 
 /// Handle para DETENER el indicador. El indicador sólo debe verse mientras el
 /// monitoreo está encendido; al soltar este handle (o llamar `detener`) la ventana
 /// se cierra y su hilo termina. Es `Send` (guarda el HWND como entero).
 pub struct IndicadorHandle {
-    hwnd: isize, // HWND como entero (0 = no se pudo crear la ventana)
+    /// HWND como entero, COMPARTIDO con el hilo (0 = todavía/nunca creado). Es un
+    /// atómico y no una copia: si la ventana se crea DESPUÉS de que venza el
+    /// handshake de 5 s, una copia en cero haría que `parar()` no mandara el
+    /// WM_CLOSE y el `join()` colgara el agente para siempre (mismo arreglo que en
+    /// monitoreo_interaccion.rs).
+    hwnd: Arc<AtomicI64>,
     hilo: Option<JoinHandle<()>>,
-    permitido_pausa: bool, // eco de `permitido` al crear (para detectar cambios en monitoreo.rs)
 }
 
 impl IndicadorHandle {
@@ -108,31 +114,17 @@ impl IndicadorHandle {
         self.parar();
     }
 
-    /// Pide repintar el banner (ej. el agente auto-reanudó por tope de tiempo
-    /// privado y el estado ya cambió por fuera de un clic). PostMessageW es
-    /// thread-safe: se puede llamar desde el hilo del agente.
-    pub fn repintar(&self) {
-        if self.hwnd != 0 {
-            unsafe {
-                PostMessageW(self.hwnd as HWND, WM_REPINTAR, 0, 0);
-            }
-        }
-    }
-
-    /// Con qué `permitido` se creó este indicador (para que el llamador detecte
-    /// si la política cambió y necesita recrearlo).
-    pub fn permitido_pausa(&self) -> bool {
-        self.permitido_pausa
-    }
-
     fn parar(&mut self) {
         if let Some(hilo) = self.hilo.take() {
-            if self.hwnd != 0 {
+            // Se relee el HWND: si la ventana se creó tarde, acá ya está. Si vale 0,
+            // el hilo terminó solo (CreateWindowExW falló) y el join no bloquea.
+            let hwnd = self.hwnd.load(Ordering::SeqCst);
+            if hwnd != 0 {
                 // PostMessageW es thread-safe: encola WM_CLOSE en el hilo dueño de la
                 // ventana. Ese hilo hace DestroyWindow -> WM_DESTROY -> PostQuitMessage,
                 // GetMessageW devuelve 0 y el loop termina limpio.
                 unsafe {
-                    PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
+                    PostMessageW(hwnd as HWND, WM_CLOSE, 0, 0);
                 }
             }
             let _ = hilo.join();
@@ -148,19 +140,31 @@ impl Drop for IndicadorHandle {
 }
 
 /// Enciende el indicador visible en su propio hilo y devuelve un handle para pararlo.
-/// Nunca hace panic: si la ventana no se puede crear, devuelve un handle "vacío"
-/// (hwnd = 0) y lo registra en el log; el resto del monitoreo puede seguir.
-pub fn iniciar_indicador(privado: Arc<AtomicBool>, permitido: bool) -> IndicadorHandle {
+/// Nunca hace panic —ni si el sistema no puede crear el hilo: `Builder::spawn`
+/// devuelve `Result`, y el release es `panic = 'abort'`—. Si la ventana no se puede
+/// crear, devuelve un handle "vacío" (hwnd = 0) y lo registra en el log; el resto
+/// del monitoreo puede seguir.
+pub fn iniciar_indicador() -> IndicadorHandle {
     let (tx, rx) = std::sync::mpsc::channel::<isize>();
+    let hwnd = Arc::new(AtomicI64::new(0));
+    let hwnd_hilo = hwnd.clone();
 
-    let hilo = std::thread::spawn(move || unsafe {
-        correr_ventana(tx, EstadoIndicador { privado, permitido });
-    });
-    let permitido_pausa = permitido;
+    let hilo = match std::thread::Builder::new()
+        .name("dessau-indicador".into())
+        .spawn(move || unsafe {
+            correr_ventana(tx, hwnd_hilo);
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("[indicador] no se pudo crear el hilo del indicador: {e}");
+            return IndicadorHandle { hwnd, hilo: None };
+        }
+    };
 
-    // Esperamos (con tope) a que el hilo cree la ventana y nos devuelva su HWND.
-    let hwnd = rx.recv_timeout(Duration::from_secs(5)).unwrap_or(0);
-    if hwnd == 0 {
+    // Esperamos (con tope) a que el hilo cree la ventana; la fuente de verdad del
+    // HWND es el atómico, que el hilo escribe apenas la crea.
+    let _ = rx.recv_timeout(Duration::from_secs(5));
+    if hwnd.load(Ordering::SeqCst) == 0 {
         log::warn!("[indicador] no se pudo crear la ventana del indicador visible");
     } else {
         log::info!("[indicador] indicador visible de monitoreo ACTIVO");
@@ -169,29 +173,27 @@ pub fn iniciar_indicador(privado: Arc<AtomicBool>, permitido: bool) -> Indicador
     IndicadorHandle {
         hwnd,
         hilo: Some(hilo),
-        permitido_pausa,
     }
 }
 
 /// Cuerpo del hilo del indicador: registra la clase (una vez), crea la ventana,
 /// avisa el HWND por el canal y corre el message loop hasta WM_QUIT.
-unsafe fn correr_ventana(tx: Sender<isize>, estado: EstadoIndicador) {
+unsafe fn correr_ventana(tx: Sender<isize>, hwnd_compartido: Arc<AtomicI64>) {
     let hinst = GetModuleHandleW(std::ptr::null()) as HINSTANCE;
     registrar_clase(hinst);
 
-    // El estado vive en el hilo del indicador (aquí mismo), leído/escrito por
-    // WM_PAINT y WM_LBUTTONUP.
-    ESTADO.with(|c| *c.borrow_mut() = Some(estado));
-
     let clase = a_wide(CLASE);
     let titulo = a_wide("Dessau");
-    let (x, y, w, h) = calcular_posicion();
+    let w = medir_ancho();
+    let h = ALTO;
+    let (x, y) = esquina(w, h);
 
-    // Sin WS_EX_TRANSPARENT: el banner debe recibir clics (botón "Pausar
-    // privado"). Sigue sin robar foco (WS_EX_NOACTIVATE) ni aparecer en la
+    // WS_EX_TRANSPARENT: click-through. El banner NO recibe clics — no se puede
+    // pausar, mover ni cerrar desde el escritorio del trabajador, y nunca bloquea
+    // lo que hay debajo. Sigue sin robar foco (WS_EX_NOACTIVATE) ni aparecer en la
     // barra de tareas (WS_EX_TOOLWINDOW).
     let hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
         clase.as_ptr(),
         titulo.as_ptr(),
         WS_POPUP, // sin WS_VISIBLE: lo mostramos con SW_SHOWNOACTIVATE (no activa/roba foco)
@@ -214,15 +216,23 @@ unsafe fn correr_ventana(tx: Sender<isize>, estado: EstadoIndicador) {
         return;
     }
 
-    // Casi opaco pero un poco translúcido y CLICK-THROUGH (WS_EX_TRANSPARENT): nunca
-    // tapa ni bloquea lo que hay debajo.
+    // Esquinas redondeadas. El sistema sólo adopta la región si SetWindowRgn
+    // devuelve != 0; si falla, la región sigue siendo nuestra y hay que liberarla.
+    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, RADIO, RADIO);
+    if !rgn.is_null() && SetWindowRgn(hwnd, rgn, TRUE) == 0 {
+        DeleteObject(rgn as HGDIOBJ);
+    }
+
+    // Casi opaco pero un poco translúcido: bien visible sin tapar del todo lo de abajo.
     SetLayeredWindowAttributes(hwnd, 0, ALPHA, LWA_ALPHA);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd);
     // Reafirmar topmost cada 2 s por si otra ventana "always on top" se pone encima.
     SetTimer(hwnd, TIMER_TOPMOST, 2000, None);
 
-    // Publicamos el HWND para que iniciar_indicador() pueda pararlo luego.
+    // Publicamos el HWND para que iniciar_indicador() pueda pararlo luego: el
+    // atómico es lo que manda; el canal solo sirve para loguear a tiempo.
+    hwnd_compartido.store(hwnd as i64, Ordering::SeqCst);
     let _ = tx.send(hwnd as isize);
 
     // Message loop: DEBE correr en este hilo (el que creó la ventana).
@@ -232,6 +242,8 @@ unsafe fn correr_ventana(tx: Sender<isize>, estado: EstadoIndicador) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    // La ventana ya no existe: que nadie le mande mensajes.
+    hwnd_compartido.store(0, Ordering::SeqCst);
 }
 
 /// Registra la clase de ventana. Se llama en cada arranque del indicador; si ya
@@ -264,30 +276,12 @@ unsafe fn registrar_clase(hinst: HINSTANCE) {
 }
 
 /// Procedimiento de ventana. `extern "system"` + `#[no_mangle]` no es necesario
-/// (se pasa por puntero en WNDCLASSEXW), pero sí la ABI del sistema.
+/// (se pasa por puntero en WNDCLASSEXW), pero sí la ABI del sistema. No hay
+/// WM_LBUTTONUP: la ventana es click-through y el banner no se puede pausar.
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
             pintar(hwnd);
-            0
-        }
-        WM_LBUTTONUP => {
-            // Clic del trabajador: alterna tiempo privado (solo si TI lo permite).
-            ESTADO.with(|c| {
-                if let Some(e) = c.borrow().as_ref() {
-                    if e.permitido {
-                        let nuevo = !e.privado.load(Ordering::SeqCst);
-                        e.privado.store(nuevo, Ordering::SeqCst);
-                        log::info!("[indicador] tiempo privado -> {nuevo} (clic del trabajador)");
-                    }
-                }
-            });
-            InvalidateRect(hwnd, std::ptr::null(), TRUE);
-            0
-        }
-        WM_REPINTAR => {
-            // El agente pide repintar (ej. auto-reanudó por tope de tiempo privado).
-            InvalidateRect(hwnd, std::ptr::null(), TRUE);
             0
         }
         WM_TIMER => {
@@ -305,8 +299,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         }
         WM_DISPLAYCHANGE => {
             // Cambió la resolución/monitores: reubicar en la esquina y repintar.
-            let (x, y, w, h) = calcular_posicion();
-            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            let mut rc: RECT = std::mem::zeroed();
+            if GetClientRect(hwnd, &mut rc) != 0 {
+                let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+                let (x, y) = esquina(w, h);
+                SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
             InvalidateRect(hwnd, std::ptr::null(), TRUE);
             0
         }
@@ -323,9 +321,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
     }
 }
 
-/// Pinta el banner: fondo oscuro + texto claro + el "●" en verde. Crea y libera
-/// sus objetos GDI en cada WM_PAINT (el banner es estático, así que WM_PAINT es
-/// raro); así no hay estado por-ventana que gestionar ni fugas de GDI.
+/// Pinta el banner con la identidad Dessau: fondo azul institucional, franja teal
+/// a la izquierda y el texto por tramos (testigo teal, aviso en blanco, marca en
+/// dorado). Crea y libera sus objetos GDI en cada WM_PAINT (el banner es estático,
+/// así que WM_PAINT es raro); así no hay estado por-ventana ni fugas de GDI.
 unsafe fn pintar(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let hdc: HDC = BeginPaint(hwnd, &mut ps);
@@ -339,16 +338,61 @@ unsafe fn pintar(hwnd: HWND) {
         return;
     }
 
-    // Fondo oscuro (gris azulado).
-    let brush: HBRUSH = CreateSolidBrush(color(24, 28, 36));
-    if !brush.is_null() {
-        FillRect(hdc, &rc, brush);
-        DeleteObject(brush as HGDIOBJ);
+    // Fondo azul corporativo.
+    let fondo: HBRUSH = CreateSolidBrush(color(NAVY));
+    if !fondo.is_null() {
+        FillRect(hdc, &rc, fondo);
+        DeleteObject(fondo as HGDIOBJ);
     }
 
-    // Fuente Segoe UI semibold ~13.5pt (altura negativa = alto de carácter).
+    // Franja teal del borde izquierdo (acento de marca).
+    let mut rb = rc;
+    rb.right = rb.left + BARRA;
+    let franja: HBRUSH = CreateSolidBrush(color(TEAL));
+    if !franja.is_null() {
+        FillRect(hdc, &rb, franja);
+        DeleteObject(franja as HGDIOBJ);
+    }
+
+    let font: HFONT = crear_fuente();
+    let old: HGDIOBJ = if font.is_null() {
+        std::ptr::null_mut()
+    } else {
+        SelectObject(hdc, font as HGDIOBJ)
+    };
+
+    SetBkMode(hdc, TRANSPARENT as i32);
+    let fmt = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_NOCLIP;
+
+    // Tramo a tramo, avanzando la x con el ancho real de cada texto.
+    let mut x = BARRA + PAD;
+    for (texto, col, gap) in TRAMOS.iter() {
+        x += gap;
+        let w = a_wide(texto);
+        let mut rt = rc;
+        rt.left = x;
+        SetTextColor(hdc, color(*col));
+        DrawTextW(hdc, w.as_ptr(), -1, &mut rt, fmt);
+        x += ancho_texto(hdc, &w);
+    }
+
+    // Restaurar y liberar la fuente (restaurar ANTES de borrar: no se puede borrar
+    // un objeto que sigue seleccionado).
+    if !old.is_null() {
+        SelectObject(hdc, old);
+    }
+    if !font.is_null() {
+        DeleteObject(font as HGDIOBJ);
+    }
+
+    EndPaint(hwnd, &ps);
+}
+
+/// Segoe UI semibold ~13.5pt (altura negativa = alto de carácter). CreateFontW
+/// copia el nombre de la tipografía, así que el buffer local puede morir acá.
+unsafe fn crear_fuente() -> HFONT {
     let face = a_wide("Segoe UI");
-    let font: HFONT = CreateFontW(
+    CreateFontW(
         -18,
         0,
         0,
@@ -363,70 +407,70 @@ unsafe fn pintar(hwnd: HWND) {
         CLEARTYPE_QUALITY as u32,
         (DEFAULT_PITCH | FF_DONTCARE) as u32,
         face.as_ptr(),
-    );
+    )
+}
+
+/// Ancho en píxeles de un texto ya convertido a UTF-16 con NUL final, en ese DC.
+unsafe fn ancho_texto(hdc: HDC, w: &[u16]) -> i32 {
+    let n = w.len().saturating_sub(1) as i32; // sin el NUL final
+    if n <= 0 {
+        return 0;
+    }
+    let mut s: SIZE = std::mem::zeroed();
+    if GetTextExtentPoint32W(hdc, w.as_ptr(), n, &mut s) == 0 {
+        0
+    } else {
+        s.cx
+    }
+}
+
+/// Ancho del banner medido con la tipografía real, para que el texto no se corte
+/// si cambia el DPI o la fuente del sistema. Si algo falla, cae al ancho fijo.
+unsafe fn medir_ancho() -> i32 {
+    let hdc = GetDC(std::ptr::null_mut());
+    if hdc.is_null() {
+        return ANCHO_FALLBACK;
+    }
+    let font = crear_fuente();
     let old: HGDIOBJ = if font.is_null() {
         std::ptr::null_mut()
     } else {
         SelectObject(hdc, font as HGDIOBJ)
     };
 
-    SetBkMode(hdc, TRANSPARENT as i32);
+    let mut total = BARRA + PAD + PAD_DER;
+    for (texto, _, gap) in TRAMOS.iter() {
+        total += gap + ancho_texto(hdc, &a_wide(texto));
+    }
 
-    let mut rt = rc;
-    rt.left += 14; // pequeño padding izquierdo
-    let fmt = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_NOCLIP;
-
-    // Estado actual: leído del tiempo-privado compartido con el agente.
-    let (privado, permitido) = ESTADO.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|e| (e.privado.load(Ordering::SeqCst), e.permitido))
-            .unwrap_or((false, false))
-    });
-
-    let (texto, color_punto) = if privado {
-        ("\u{23F8} Tiempo privado — clic para reanudar", color(230, 176, 46)) // ámbar
-    } else if permitido {
-        ("\u{25CF} Monitoreo activo — Dessau (clic = pausa privada)", color(46, 204, 113))
-    } else {
-        (TEXTO, color(46, 204, 113))
-    };
-
-    // 1) Texto completo en blanco.
-    let full = a_wide(texto);
-    SetTextColor(hdc, color(238, 238, 238));
-    DrawTextW(hdc, full.as_ptr(), -1, &mut rt, fmt);
-
-    // 2) El símbolo inicial ("●" o "⏸") repintado ENCIMA en su color, misma
-    //    alineación izquierda: cae justo sobre el símbolo blanco de abajo.
-    let simbolo: Vec<u16> = texto.chars().take(1).collect::<String>().encode_utf16().chain(std::iter::once(0)).collect();
-    SetTextColor(hdc, color_punto);
-    DrawTextW(hdc, simbolo.as_ptr(), -1, &mut rt, fmt);
-
-    // Restaurar y liberar la fuente (restaurar ANTES de borrar: no se puede borrar
-    // un objeto que sigue seleccionado).
     if !old.is_null() {
         SelectObject(hdc, old);
     }
     if !font.is_null() {
         DeleteObject(font as HGDIOBJ);
     }
+    ReleaseDC(std::ptr::null_mut(), hdc);
 
-    EndPaint(hwnd, &ps);
+    if total < 200 {
+        ANCHO_FALLBACK
+    } else {
+        total
+    }
 }
 
 /// Esquina inferior derecha del monitor primario. GetSystemMetrics da píxeles del
 /// monitor primario en el contexto DPI del proceso (ver nota de DPI en el reporte).
-unsafe fn calcular_posicion() -> (i32, i32, i32, i32) {
+unsafe fn esquina(ancho: i32, alto: i32) -> (i32, i32) {
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
-    let x = (sw - ANCHO - MARGEN).max(0);
-    let y = (sh - ALTO - GAP_TASKBAR).max(0);
-    (x, y, ANCHO, ALTO)
+    (
+        (sw - ancho - MARGEN).max(0),
+        (sh - alto - GAP_TASKBAR).max(0),
+    )
 }
 
 /// COLORREF (0x00BBGGRR) a partir de componentes RGB, sin depender de la macro RGB.
-fn color(r: u8, g: u8, b: u8) -> u32 {
+fn color((r, g, b): (u8, u8, u8)) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
 

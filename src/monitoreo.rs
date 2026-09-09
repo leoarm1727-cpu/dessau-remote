@@ -13,7 +13,11 @@
 //
 //  Qué hace, según la política que devuelve el servidor:
 //   1. REGISTRO: late con identidad (hostname+IP+SO); el backend detecta cambios.
-//   2. ACTIVIDAD (si `seguimiento_actividad`): intervalos activo/ocioso + título.
+//   2. ACTIVIDAD (si `seguimiento_actividad`): intervalos activo/ocioso + título,
+//      con los CONTADORES AGREGADOS de interacción del intervalo (pulsaciones,
+//      clics y segundos con movimiento de mouse). Son TOTALES: nunca la tecla,
+//      el contenido ni las coordenadas — ver monitoreo_interaccion.rs y el
+//      Reglamento RI-TI-001, que los admite solo para RESTAR casos.
 //   3. CAPTURA (si `capturas_activas`): screenshot por monitor -> edge de capturas.
 //  Apagar el monitoreo desde Admin lo apaga en el siguiente latido (y oculta el
 //  indicador). La política vive en el servidor, no en el agente.
@@ -21,10 +25,9 @@
 #![cfg(windows)]
 
 use crate::monitoreo_indicador::IndicadorHandle;
+use crate::monitoreo_interaccion::{ContadorHandle, Contadores};
 use hbb_common::log;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const AGENTE_VERSION: &str = concat!("dessau-monitoreo/", env!("CARGO_PKG_VERSION"));
@@ -123,8 +126,6 @@ struct Politica {
     difuminar: bool,
     aviso_texto: String,
     aviso_version: i64,
-    tiempo_privado_permitido: bool,
-    tiempo_privado_max_min: u64,
 }
 
 impl Politica {
@@ -145,8 +146,6 @@ impl Politica {
             difuminar: false,
             aviso_texto: String::new(),
             aviso_version: 1,
-            tiempo_privado_permitido: false,
-            tiempo_privado_max_min: 60,
         }
     }
 
@@ -164,9 +163,8 @@ impl Politica {
         self.capturar_titulos = b("capturar_titulos", self.capturar_titulos);
         self.capturar_urls = b("capturar_urls", self.capturar_urls);
         self.difuminar = b("difuminar_capturas", self.difuminar);
-        self.tiempo_privado_permitido = b("tiempo_privado_permitido", self.tiempo_privado_permitido);
-        self.tiempo_privado_max_min =
-            n("tiempo_privado_max_min", self.tiempo_privado_max_min).clamp(5, 480);
+        // `tiempo_privado_*` del servidor se ignora a propósito: el indicador ya no
+        // se puede pausar (ver monitoreo_indicador.rs).
         if let Some(s) = c.get("aviso_texto").and_then(|v| v.as_str()) {
             self.aviso_texto = s.to_string();
         }
@@ -375,6 +373,12 @@ struct Abierto {
     titulo: Option<String>,
     app: Option<String>,
     url: Option<String>,
+    /// Totales de interacción imputados a ESTE intervalo (solo cantidades).
+    /// `None` = el contador no estaba midiendo ⇒ se reporta NULL, nunca cero:
+    /// cero significa "medí y no hubo interacción" y dispara la compuerta de
+    /// validez CONTRA el trabajador (ver Reglamento RI-TI-001 y la migración
+    /// 20260908213000: NULL ≠ 0).
+    inter: Option<Contadores>,
 }
 
 fn cerrar(a: Abierto) -> serde_json::Value {
@@ -387,6 +391,12 @@ fn cerrar(a: Abierto) -> serde_json::Value {
         "titulo": a.titulo,
         "url": a.url,                          // dominio -> clasifica navegación (opt-in)
         "estado": a.estado,
+        // Contadores AGREGADOS del intervalo. Solo cantidad: el servidor no puede
+        // reconstruir qué se tecleó ni dónde se hizo clic porque eso no se mide.
+        // Sin contador sano van en null (ausencia de dato), no en cero.
+        "pulsaciones": a.inter.map(|c| c.pulsaciones),
+        "clics": a.inter.map(|c| c.clics),
+        "segMovimiento": a.inter.map(|c| c.seg_movimiento),
     })
 }
 
@@ -478,16 +488,15 @@ pub fn ejecutar() {
     }
     let mut abierto: Option<Abierto> = None;
     let mut indicador: Option<IndicadorHandle> = None;
+    let mut contador: Option<ContadorHandle> = None;
+    // Si el contador no arranca (raw input rechazado, sesión rara), se reintenta
+    // cada tanto en vez de quedar mudo toda la sesión de Windows; mientras tanto
+    // el intervalo va con NULL.
+    let mut ultimo_intento_contador: Option<Instant> = None;
+    const REINTENTO_CONTADOR_SEG: u64 = 300;
     let mut ultimo_envio = Instant::now();
     let mut ultima_captura = Instant::now();
     let mut primera = true;
-
-    // Tiempo privado: el trabajador lo alterna con un clic en el indicador (banner).
-    // El flag es compartido (Arc<AtomicBool>) con ese hilo. Mientras está en true,
-    // app/título/URL se apagan ACÁ (el agente, no solo el edge) y se manda
-    // estado="privado" — minimización en origen, defensa en profundidad.
-    let privado_flag = Arc::new(AtomicBool::new(false));
-    let mut privado_desde: Option<Instant> = None;
 
     loop {
         // 1) ¿monitorear? Requiere política ON + CONSENTIMIENTO informado vigente.
@@ -499,86 +508,80 @@ pub fn ejecutar() {
         };
         let activo = quiere_monitorear && consentido;
 
-        // Si TI apagó el permiso de tiempo privado (o el monitoreo), no dejar el
-        // flag trabado en true de una sesión anterior.
-        if !pol.tiempo_privado_permitido || !activo {
-            if privado_flag.swap(false, Ordering::SeqCst) {
-                privado_desde = None;
-            }
-        }
-
-        // Auto-reanudar si superó el máximo permitido (evita "me olvidé de reanudar").
-        if privado_flag.load(Ordering::SeqCst) {
-            if privado_desde.is_none() {
-                privado_desde = Some(Instant::now());
-            }
-            if let Some(t0) = privado_desde {
-                if t0.elapsed().as_secs() >= pol.tiempo_privado_max_min * 60 {
-                    privado_flag.store(false, Ordering::SeqCst);
-                    privado_desde = None;
-                    log::info!("[monitoreo] tiempo privado auto-reanudado (tope de {} min)", pol.tiempo_privado_max_min);
-                    if let Some(h) = &indicador {
-                        h.repintar();
-                    }
-                }
-            }
-        } else {
-            privado_desde = None;
-        }
-
-        // 2) Indicador visible: encendido sólo mientras se monitorea de verdad.
-        // Se recrea si cambió el permiso de tiempo privado (el banner necesita
-        // saberlo para aceptar o ignorar el clic).
-        let permiso_cambio = indicador
-            .as_ref()
-            .map(|h| h.permitido_pausa() != pol.tiempo_privado_permitido)
-            .unwrap_or(false);
-        if permiso_cambio {
-            if let Some(h) = indicador.take() {
-                h.detener();
-            }
-        }
+        // 2) Indicador visible: encendido sólo mientras se monitorea de verdad. El
+        // trabajador no lo puede pausar ni cerrar; sólo se va si TI apaga el monitoreo.
         if activo && indicador.is_none() {
-            indicador = Some(crate::monitoreo_indicador::iniciar_indicador(
-                privado_flag.clone(),
-                pol.tiempo_privado_permitido,
-            ));
+            indicador = Some(crate::monitoreo_indicador::iniciar_indicador());
         } else if !activo {
             if let Some(h) = indicador.take() {
                 h.detener();
             }
         }
 
+        // 2 bis) Contadores de interacción: viven exactamente mientras se mide
+        // actividad (mismo consentimiento, mismo interruptor). Apagado el
+        // seguimiento, el hilo muere y lo no leído se descarta.
+        if activo && pol.seguimiento {
+            // Un handle que no está midiendo se suelta y se reintenta con backoff.
+            if contador.as_ref().map(|c| !c.activo()).unwrap_or(false) {
+                if let Some(c) = contador.take() {
+                    c.detener();
+                }
+            }
+            let toca_reintentar = ultimo_intento_contador
+                .map(|t| t.elapsed().as_secs() >= REINTENTO_CONTADOR_SEG)
+                .unwrap_or(true);
+            if contador.is_none() && toca_reintentar {
+                ultimo_intento_contador = Some(Instant::now());
+                contador = Some(crate::monitoreo_interaccion::iniciar_contador());
+            }
+        } else {
+            if let Some(c) = contador.take() {
+                c.detener();
+            }
+            ultimo_intento_contador = None;
+        }
+        // ¿Se puede afirmar algo de la interacción de este muestreo?
+        let inter_ok = contador.as_ref().map(|c| c.activo()).unwrap_or(false);
+
         // 3) Muestrear actividad (sólo si activo && seguimiento).
         if activo && pol.seguimiento {
-            let en_privado = pol.tiempo_privado_permitido && privado_flag.load(Ordering::SeqCst);
             let idle = inactividad_ms();
-            let estado: &'static str = if en_privado {
-                "privado"
-            } else if idle >= pol.idle_seg * 1000 {
+            let estado: &'static str = if idle >= pol.idle_seg * 1000 {
                 "ocioso"
             } else {
                 "activo"
             };
-            // En tiempo privado no se lee NADA de contenido (defensa en profundidad;
-            // el edge también lo anula, pero acá ni se intenta leer). El .exe se
-            // captura siempre que haya seguimiento (es la base de la clasificación de
-            // productividad); el título va gateado por capturar_titulos.
-            let app = if en_privado { None } else { app_primer_plano() };
-            let titulo = if en_privado || !pol.capturar_titulos {
+            // El .exe se captura siempre que haya seguimiento (es la base de la
+            // clasificación de productividad); el título va gateado por capturar_titulos.
+            let app = app_primer_plano();
+            let titulo = if !pol.capturar_titulos {
                 None
             } else {
                 let t = ventana_primer_plano();
                 if t.is_empty() { None } else { Some(t) }
             };
-            // URL: solo si TI la habilitó (opt-in) y no está en privado.
+            // URL: solo si TI la habilitó (opt-in).
             // url_de_navegador ya devuelve None si el .exe no es un navegador soportado.
-            let url = if en_privado || !pol.capturar_urls {
+            let url = if !pol.capturar_urls {
                 None
             } else {
                 app.as_deref().and_then(crate::monitoreo_url::url_de_navegador)
             };
             let ahora = chrono::Utc::now();
+            // Lo acumulado desde la lectura anterior ocurrió mientras estaba abierto
+            // el intervalo actual: se le imputa a ÉSE, antes de decidir si sigue o se
+            // corta. Si no hay intervalo abierto (primera vuelta), se descarta.
+            let delta = crate::monitoreo_interaccion::tomar();
+            if let Some(a) = abierto.as_mut() {
+                // Si el contador no está sano, el intervalo queda en NULL y ahí se
+                // queda: un tramo medio medido no es un tramo medido.
+                if !inter_ok {
+                    a.inter = None;
+                } else if let Some(acum) = a.inter.as_mut() {
+                    acum.sumar(delta);
+                }
+            }
             // Se corta el intervalo cuando cambia el estado, la app O la URL, así el
             // panel reparte el tiempo por programa y por sitio (no lo agrupa todo).
             let extender =
@@ -592,7 +595,19 @@ pub fn ejecutar() {
                 if let Some(a) = abierto.take() {
                     buf.push(cerrar(a));
                 }
-                abierto = Some(Abierto { inicio: ahora, fin: ahora, estado, titulo, app, url });
+                abierto = Some(Abierto {
+                    inicio: ahora,
+                    fin: ahora,
+                    estado,
+                    titulo,
+                    app,
+                    url,
+                    inter: if inter_ok {
+                        Some(Contadores::default())
+                    } else {
+                        None
+                    },
+                });
             }
         }
 
@@ -609,7 +624,12 @@ pub fn ejecutar() {
 
         // 5) Latido de actividad/registro cada envio_seg (y el primero de una).
         if primera || ultimo_envio.elapsed().as_secs() >= pol.envio_seg {
-            if let Some(a) = abierto.take() {
+            if let Some(mut a) = abierto.take() {
+                // Lo ocurrido entre el último muestreo y el envío es de este intervalo.
+                let cola = crate::monitoreo_interaccion::tomar();
+                if let Some(acum) = a.inter.as_mut() {
+                    acum.sumar(cola);
+                }
                 buf.push(cerrar(a));
             }
             // Si estuvimos offline, quedarnos con las muestras MÁS RECIENTES.
