@@ -1,5 +1,5 @@
 ; =============================================================================
-;  Dessau Soporte y Productividad — INSTALADOR ÚNICO (Inno Setup)
+;  RustDesk — INSTALADOR ÚNICO (Inno Setup)
 ; -----------------------------------------------------------------------------
 ;  Produce UN solo "Dessau-Setup.exe" que:
 ;    1. empaqueta la app Flutter compilada (rustdesk.exe + DLLs + data/) y corre
@@ -21,9 +21,9 @@
 ;     código del fork (AGPL). Ver LEEME-FORK.md.
 ; =============================================================================
 
-#define AppNombre "Dessau Soporte y Productividad"
+#define AppNombre "RustDesk"
 #define AppVersion "1.0.0"
-#define AppPublisher "Dessau S&Z S.A."
+#define AppPublisher "RustDesk"
 
 ; Carpeta con la app Flutter YA compilada: rustdesk.exe + DLLs + data/.
 #ifndef AppDir
@@ -43,7 +43,7 @@ DefaultGroupName=Dessau
 DisableProgramGroupPage=yes
 UninstallDisplayName={#AppNombre}
 OutputDir=Output
-OutputBaseFilename=Dessau-Setup
+OutputBaseFilename=RustDesk-Setup
 Compression=lzma2/max
 SolidCompression=yes
 PrivilegesRequired=admin
