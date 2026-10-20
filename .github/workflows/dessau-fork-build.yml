@@ -76,8 +76,9 @@ jobs:
           if-no-files-found: error
 
       # Arma el instalador único Dessau-Setup.exe (Inno) y lo FIRMA si están los secrets
-      # del certificado. El config lleva SOLO la URL (sin secreto: cada equipo genera el
-      # suyo en 1ra corrida). Sin firma es testeable; con CERT_PFX_BASE64 + CERT_PFX_PASSWORD
+      # del certificado. El config lleva SOLO la URL (y apikey opcional): SIN secreto
+      # compartido horneado — cada equipo genera el suyo por-dispositivo en runtime — y
+      # el config queda LEGIBLE por el usuario (no encubierto; monitoreo declarado).
       # se firma (rustdesk.exe + instalador + desinstalador).
       - name: Instalador Inno (firma si hay cert)
         shell: pwsh

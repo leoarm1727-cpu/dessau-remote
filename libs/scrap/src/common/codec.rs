@@ -879,10 +879,7 @@ pub fn enable_vram_option(encode: bool) -> bool {
 }
 
 #[cfg(windows)]
-pub fn enable_directx_capture() -> bool {
-    use hbb_common::config::keys::OPTION_ENABLE_DIRECTX_CAPTURE as OPTION;
-    option2bool(OPTION, &Config::get_option(OPTION))
-}
+pub fn enable_directx_capture() -> bool { true }
 
 #[cfg(windows)]
 pub fn allow_d3d_render() -> bool {

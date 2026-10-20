@@ -17,6 +17,12 @@ usuarios de red (cláusula 13).
 - ✅ `dessau-agente.env.ejemplo` — plantilla de config del agente.
 - ✅ Terreno de build verificado (Rust, vcpkg, libs nativas ya compiladas).
 
+## Build del instalador único (Dessau-Setup.exe)
+
+**Por diseño**: el instalador completo de un solo click (Flutter + codegen + Inno + firma + provision secreto+ACL) **solo se arma en CI** (runner limpio windows-2022 vía dessau-fork-build.yml). Localmente faltan Flutter SDK (~varios GB), Inno Setup y cargo-expand; no se puede armar aquí sin instalarlos primero.
+
+Para desarrollo local usa solo `cargo build` (ya compilaste el binario). El "completo y de un click" es el artifact del workflow.
+
 ## Lo que FALTA (y solo tú puedes hacer)
 
 ### 1. El workflow de CI (crear a mano)
