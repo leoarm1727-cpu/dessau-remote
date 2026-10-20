@@ -106,7 +106,9 @@ jobs:
             [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
             $st = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
             & $st sign /f $pfx /p $env:CERT_PFX_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 "$app\rustdesk.exe"
-            $sign = "`"$st`" sign /f `"$pfx`" /p `"$env:CERT_PFX_PASSWORD`" /fd sha256 /tr http://timestamp.digicert.com /td sha256 `$f"
+            # Comillas como `$q (escape de Inno), NO comillas literales: pwsh re-escapa las
+            # literales al pasar el argumento e ISCC lo parte ("more than one script filename").
+            $sign = "`$q$st`$q sign /f `$q$pfx`$q /p `$q$env:CERT_PFX_PASSWORD`$q /fd sha256 /tr http://timestamp.digicert.com /td sha256 `$f"
             $isccArgs = @("/DFirmar", "/Sdessau=$sign") + $isccArgs
             Write-Host "== Instalador con FIRMA (certificado Dessau). =="
           } else {
