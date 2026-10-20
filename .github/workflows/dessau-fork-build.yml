@@ -1,0 +1,146 @@
+name: Dessau Fork Build (Windows)
+on:
+  workflow_dispatch:
+    inputs:
+      firmar:
+        description: "Firmar el .exe (requiere secrets WINDOWS_PFX_*)"
+        type: boolean
+        default: false
+env:
+  RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  # Sin binary caching de GHA (evita depender de los tokens ACTIONS_CACHE_*): las libs
+  # se compilan desde fuente cada corrida, pero de forma confiable. Se puede reactivar
+  # ("clear;x-gha,readwrite") una vez que el build esté verde.
+  VCPKG_BINARY_SOURCES: "clear"
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: KyleMayes/install-llvm-action@v2
+        with: { version: "15.0.6" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { toolchain: "1.75", targets: x86_64-pc-windows-msvc, components: rustfmt }
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with: { flutter-version: "3.24.5", channel: stable }
+      - name: vcpkg
+        shell: bash
+        run: |
+          git clone https://github.com/microsoft/vcpkg
+          cd vcpkg && git checkout ${{ env.VCPKG_COMMIT_ID }}
+          ./bootstrap-vcpkg.sh
+          VCPKG=$PWD
+          echo "VCPKG_ROOT=$VCPKG" >> $GITHUB_ENV
+          cd ..
+          # Instala las libs nativas del manifest (opus/aom/vpx/yuv/jpeg) en el triplet
+          # estático, DONDE los build scripts de los crates las buscan (installed/). Modo
+          # manifest: lee vcpkg.json y sus overlay-ports/triplets del root del repo.
+          # Sin este install, magnum-opus no encuentra opus/opus_multistream.h y bindgen
+          # panica (unwrap sobre Err(())).
+          "$VCPKG/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG/installed"
+      - shell: bash
+        run: pip3 install --upgrade pip && pip3 install requests
+      # RustDesk genera src/bridge_generated.rs (gitignored) con flutter_rust_bridge_codegen
+      # en un workflow aparte (bridge.yml) y los demas builds bajan el artifact. Como este
+      # build es autonomo, lo generamos aca ANTES de cargo build. La version DEBE ser la del
+      # crate (=1.80 -> 1.80.1). Sin esto: E0583 "file not found for module bridge_generated".
+      - name: flutter_rust_bridge codegen
+        shell: bash
+        run: |
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features "uuid" --locked
+          mkdir -p flutter/macos/Runner
+          pushd flutter && flutter pub get && popd
+          flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+      - name: Build
+        shell: bash
+        env:
+          VCPKG_ROOT: "${{ env.VCPKG_ROOT }}"
+          DESSAU_INSTALADOR_VERSION: "1.5.0.${{ github.run_number }}"
+        # SIN --hwcodec/--vram: el codec por hardware (Intel Media SDK) no compila en
+        # CI (cl.exe error 2 en mfx_decode.cpp) y no lo necesitamos — RustDesk anda con
+        # codec por software y el agente de monitoreo no depende del codec.
+        run: python3 ./build.py --portable --flutter --skip-portable-pack
+      # La app Flutter NO es un solo .exe: es la carpeta Release (rustdesk.exe + DLLs +
+      # data/). Subimos la carpeta COMPLETA; el instalador (Inno) la empaqueta y corre
+      # `rustdesk.exe --silent-install` (que instala servicio + autoarranque).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dessau-rustdesk-windows
+          path: flutter/build/windows/x64/runner/Release
+          if-no-files-found: error
+
+      # Arma el instalador único Dessau-Setup.exe (Inno) y lo FIRMA si están los secrets
+      # del certificado. El config lleva SOLO la URL (sin secreto: cada equipo genera el
+      # suyo en 1ra corrida). Sin firma es testeable; con CERT_PFX_BASE64 + CERT_PFX_PASSWORD
+      # se firma (rustdesk.exe + instalador + desinstalador).
+      - name: Instalador Inno (firma si hay cert)
+        shell: pwsh
+        env:
+          CERT_PFX_BASE64: ${{ secrets.CERT_PFX_BASE64 }}
+          CERT_PFX_PASSWORD: ${{ secrets.CERT_PFX_PASSWORD }}
+          DESSAU_MONITOREO_URL: ${{ vars.DESSAU_MONITOREO_URL }}
+          DESSAU_MONITOREO_APIKEY: ${{ secrets.DESSAU_MONITOREO_APIKEY }}
+        run: |
+          choco install innosetup --no-progress -y
+          $app = "flutter\build\windows\x64\runner\Release"
+          $env:DESSAU_APP_DIR = (Resolve-Path $app).Path
+          # Config del agente que Inno empaqueta: SOLO la URL (y apikey opcional). El
+          # secreto NO va acá — cada equipo genera el suyo por-dispositivo en runtime.
+          $cfgDir = "installer\_config"
+          New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+          $url = if ($env:DESSAU_MONITOREO_URL) { $env:DESSAU_MONITOREO_URL.Trim() } else { "https://pwjlxoladntvlnzhnqyi.supabase.co/functions/v1/monitoreo-actividad-device" }
+          $ak  = if ($env:DESSAU_MONITOREO_APIKEY) { $env:DESSAU_MONITOREO_APIKEY.Trim() } else { "" }
+          $cfg = "DESSAU_MONITOREO_URL=$url`r`nDESSAU_MONITOREO_APIKEY=$ak`r`nDESSAU_MONITOREO_INTERVALO=60`r`n"
+          [IO.File]::WriteAllText("$cfgDir\config", $cfg, [Text.Encoding]::ASCII)
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $isccArgs = @("installer\dessau-monitor.iss")
+          $pfx = $null
+          if ($env:CERT_PFX_BASE64 -and $env:CERT_PFX_PASSWORD) {
+            $pfx = "$env:RUNNER_TEMP\dessau.pfx"
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+            $st = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1).FullName
+            & $st sign /f $pfx /p $env:CERT_PFX_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 "$app\rustdesk.exe"
+            $sign = "`"$st`" sign /f `"$pfx`" /p `"$env:CERT_PFX_PASSWORD`" /fd sha256 /tr http://timestamp.digicert.com /td sha256 `$f"
+            $isccArgs = @("/DFirmar", "/Sdessau=$sign") + $isccArgs
+            Write-Host "== Instalador con FIRMA (certificado Dessau). =="
+          } else {
+            Write-Host "== Sin CERT_PFX_BASE64 + CERT_PFX_PASSWORD: instalador SIN firmar (testeable; agrega los dos secrets para firmarlo). =="
+          }
+          & $iscc @isccArgs
+          if ($pfx -and (Test-Path $pfx)) { Remove-Item $pfx -Force }
+
+      - name: Subir el instalador (firmado o no)
+        if: ${{ hashFiles('installer/Output/Dessau-Setup.exe') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dessau-Setup
+          path: installer/Output/Dessau-Setup.exe
+          if-no-files-found: error
+      - name: Publicar release (hot-update)
+        if: ${{ hashFiles('installer/Output/Dessau-Setup.exe') != '' }}
+        shell: pwsh
+        env:
+          CI_PUBLISH_SECRET: ${{ secrets.CI_PUBLISH_SECRET }}
+          VERSION: "1.5.0.${{ github.run_number }}"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe  = (Resolve-Path "installer/Output/Dessau-Setup.exe").Path
+          $sha  = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          $proj = "https://pwjlxoladntvlnzhnqyi.supabase.co"
+          $fn   = "$proj/functions/v1/monitoreo-publicar-release"
+          $h    = @{ "x-ci-secret" = $env:CI_PUBLISH_SECRET; "Content-Type" = "application/json" }
+          $b1 = @{ accion = "iniciar"; version = $env:VERSION } | ConvertTo-Json
+          $r1 = Invoke-RestMethod -Method Post -Uri $fn -Headers $h -Body $b1
+          if (-not $r1.signedUrl) { throw "sin signedUrl" }
+          $upUrl = $r1.signedUrl
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          Invoke-RestMethod -Method Put -Uri $upUrl -Headers @{ "Content-Type" = "application/octet-stream" } -Body $bytes
+          $b3 = @{ accion = "confirmar"; version = $env:VERSION; sha256 = $sha; notas = "CI run ${{ github.run_number }}" } | ConvertTo-Json
+          $r3 = Invoke-RestMethod -Method Post -Uri $fn -Headers $h -Body $b3
+          Write-Host "Publicada release $($r3.version) ($sha)"
