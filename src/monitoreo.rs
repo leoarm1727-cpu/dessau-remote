@@ -447,11 +447,6 @@ pub fn ejecutar() {
         };
         let activo = quiere_monitorear && consentido;
 
-            if let Some(h) = indicador.take() {
-                h.detener();
-            }
-        }
-
         if activo && pol.seguimiento {
 
             if contador.as_ref().map(|c| !c.activo()).unwrap_or(false) {
