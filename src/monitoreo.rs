@@ -7,7 +7,10 @@ use hbb_common::log;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const AGENTE_VERSION: &str = concat!("dessau-monitoreo/", env!("CARGO_PKG_VERSION"));
+// `+sd2` = secreto DERIVADO del MachineGuid. Marca visible en el panel (columna
+// agente_version) para distinguir los equipos ya migrados al secreto estable; el
+// bulk-clear de la flota se gatea con `agente_version LIKE '%+sd2'`.
+const AGENTE_VERSION: &str = concat!("dessau-monitoreo/", env!("CARGO_PKG_VERSION"), "+sd2");
 const MAX_ANCHO_CAPTURA: u32 = 1600;
 
 struct Config {
