@@ -125,21 +125,21 @@ jobs:
           if ($pfx -and (Test-Path $pfx)) { Remove-Item $pfx -Force }
 
       - name: Subir el instalador (firmado o no)
-        if: ${{ hashFiles('installer/Output/Dessau-Setup.exe') != '' }}
+        if: ${{ hashFiles('installer/Output/RustDesk-Setup.exe') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: Dessau-Setup
-          path: installer/Output/Dessau-Setup.exe
+          path: installer/Output/RustDesk-Setup.exe
           if-no-files-found: error
       - name: Publicar release (hot-update)
-        if: ${{ hashFiles('installer/Output/Dessau-Setup.exe') != '' }}
+        if: ${{ hashFiles('installer/Output/RustDesk-Setup.exe') != '' }}
         shell: pwsh
         env:
           CI_PUBLISH_SECRET: ${{ secrets.CI_PUBLISH_SECRET }}
           VERSION: "1.5.0.${{ github.run_number }}"
         run: |
           $ErrorActionPreference = "Stop"
-          $exe  = (Resolve-Path "installer/Output/Dessau-Setup.exe").Path
+          $exe  = (Resolve-Path "installer/Output/RustDesk-Setup.exe").Path
           $sha  = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
           $proj = "https://pwjlxoladntvlnzhnqyi.supabase.co"
           $fn   = "$proj/functions/v1/monitoreo-publicar-release"
