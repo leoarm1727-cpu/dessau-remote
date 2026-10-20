@@ -702,6 +702,14 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
     let mut h_process = launch_server(session_id, true).await.unwrap_or(NULL);
+    // Watchdog del monitor (--tray): el monitor de actividad corre en el proceso
+    // --tray (sesión del usuario, para poder ver la ventana activa). Un usuario
+    // no-admin puede matar su PROPIO proceso de sesión en el Task Manager. Este
+    // watchdog vive en el servicio SYSTEM —que el no-admin NO puede tocar— y revive
+    // el --tray si lo cierran. Se throttlea (SERVICE_INTERVAL es 300 ms y check_process
+    // refresca todos los procesos): basta revisar cada ~3 s.
+    let mut last_tray_check = std::time::Instant::now();
+    let mut tray_visto_vivo = false;
     let mut incoming = ipc::new_listener(crate::POSTFIX_SERVICE).await?;
     let mut stored_usid = None;
     loop {
@@ -795,6 +803,35 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                                 log::error!("Failed to launch server: {}", err);
                             }
                         }
+                    }
+                }
+                // ── Watchdog del monitor (--tray) ───────────────────────────────
+                // Si un usuario no-admin cierra/mata el --tray, el servicio SYSTEM lo
+                // relanza en la sesión activa (como el mismo usuario, idéntico a como
+                // arranca normalmente). Un cierre deja un hueco de a lo sumo ~3 s.
+                if last_tray_check.elapsed() >= std::time::Duration::from_secs(3) {
+                    last_tray_check = std::time::Instant::now();
+                    let tray_session = unsafe { get_current_session(share_rdp()) };
+                    if tray_session != 0xFFFFFFFF {
+                        let vivo = crate::common::check_process("--tray", false);
+                        if !vivo {
+                            if tray_visto_vivo {
+                                log::warn!(
+                                    "monitor --tray caído (posible cierre por el usuario); relanzando en sesión {}",
+                                    tray_session
+                                );
+                            }
+                            if let Ok(exe) = std::env::current_exe() {
+                                if let Some(exe) = exe.to_str() {
+                                    if let Err(e) =
+                                         run_exe_in_session(exe, vec!["--tray"], tray_session, true)
+                                    {
+                                        log::error!("no se pudo relanzar --tray: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        tray_visto_vivo = vivo;
                     }
                 }
             }
@@ -3951,6 +3988,7 @@ if exist \"%PROGRAMDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{ap
         let exe = escape_nested_cmd_ampersands(exe);
         format!("
 sc create {app_name} binpath= \"\\\"{exe}\\\" --service\" start= auto DisplayName= \"{app_name} Service\"
+sc failure {app_name} reset= 0 actions= restart/5000/restart/5000/restart/5000
 sc start {app_name}
 ",
     app_name = crate::get_app_name())
