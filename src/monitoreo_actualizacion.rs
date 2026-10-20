@@ -43,6 +43,12 @@ fn url_version() -> Option<String> {
 }
 
 fn secreto_propio(dir: &PathBuf) -> Option<String> {
+    // Camino normal: secreto DERIVADO del equipo (estable entre reinstalaciones), con una
+    // sal distinta a la del canal de actividad para que ambos secretos no coincidan.
+    if let Some(s) = crate::monitoreo::secreto_estable("dessau-monitoreo-update-v1") {
+        return Some(s);
+    }
+    // Respaldo (MachineGuid ilegible): el UUID en archivo de siempre.
     let ruta = dir.join("update-secret");
     if let Ok(s) = std::fs::read_to_string(&ruta) {
         let s = s.trim().to_string();

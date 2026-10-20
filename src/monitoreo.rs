@@ -60,7 +60,47 @@ impl Config {
     }
 }
 
+/// GUID estable de la instalación de Windows (`HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`).
+/// Se fija al instalar Windows y NO cambia al reinstalar el agente, borrar `ProgramData` ni
+/// desinstalar — por eso sirve de ancla para un secreto por-equipo que no se pierde.
+pub(crate) fn machine_guid() -> Option<String> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+    use winreg::RegKey;
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let k = hklm
+        .open_subkey_with_flags(r"SOFTWARE\Microsoft\Cryptography", KEY_READ | KEY_WOW64_64KEY)
+        .ok()?;
+    let g: String = k.get_value("MachineGuid").ok()?;
+    let g = g.trim().to_string();
+    if g.is_empty() {
+        None
+    } else {
+        Some(g)
+    }
+}
+
+/// Secreto por-equipo ESTABLE y DERIVADO: `sha256(salt | MachineGuid)`.
+/// Es idempotente entre reinstalaciones ⇒ tras el primer registro TOFU no vuelve a cambiar,
+/// así que no dispara el 401 por secreto nuevo aunque se reinstale o se borre `ProgramData`.
+/// El `salt` separa canales (actividad vs. actualización) para que sus secretos no coincidan.
+pub(crate) fn secreto_estable(salt: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let guid = machine_guid()?;
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update(b"|");
+    h.update(guid.as_bytes());
+    Some(hex::encode(h.finalize()))
+}
+
+const SALT_DEVICE: &str = "dessau-monitoreo-device-v1";
+
 fn secreto_dispositivo() -> String {
+    // 1) Camino normal: secreto DERIVADO del equipo (estable, no depende de ningún archivo).
+    if let Some(s) = secreto_estable(SALT_DEVICE) {
+        return s;
+    }
+    // 2) Respaldo (MachineGuid ilegible, muy raro): el UUID en archivo de siempre.
     let ruta = dir_config().map(|d| d.join("device-secret"));
     if let Some(r) = &ruta {
         if let Ok(s) = std::fs::read_to_string(r) {
