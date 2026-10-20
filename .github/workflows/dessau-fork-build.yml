@@ -44,7 +44,13 @@ jobs:
           # panica (unwrap sobre Err(())).
           "$VCPKG/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG/installed"
       - shell: bash
-        run: pip3 install --upgrade pip && pip3 install requests
+        # `python -m pip`, NO `pip3`: pip >=26 en Windows se niega a auto-actualizarse
+        # invocado como script (exe bloqueado) y sale 1 ("To modify pip, please run
+        # python -m pip install --upgrade pip"). El upgrade no es crítico — solo hace
+        # falta `requests` para el codegen — así que no frena el build si falla.
+        run: |
+          python -m pip install --upgrade pip || true
+          python -m pip install requests
       # RustDesk genera src/bridge_generated.rs (gitignored) con flutter_rust_bridge_codegen
       # en un workflow aparte (bridge.yml) y los demas builds bajan el artifact. Como este
       # build es autonomo, lo generamos aca ANTES de cargo build. La version DEBE ser la del
