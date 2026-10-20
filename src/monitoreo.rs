@@ -480,6 +480,19 @@ pub fn ejecutar() {
     let mut ultima_captura = Instant::now();
     let mut primera = true;
 
+    // Latido inmediato ANTES del primer tick: trae la config remota (seguimiento/capturas)
+    // para que la primera actividad y la primera captura salgan APENAS INSTALAR, en vez de
+    // esperar un intervalo completo. Sin esto, la política semilla (capturas/seguimiento en
+    // off) bloquea la captura de la 1ª iteración y la config recién se aplica después, así
+    // que la primera captura tardaba ~1-2 min. Si falla (p. ej. 401), se ignora y el loop
+    // sigue como siempre — no hay regresión.
+    {
+        let ip = ip_local_hacia(&cfg.url);
+        if let Ok(c) = enviar_actividad(&cliente, &cfg, &secret, &host, ip.as_deref(), &so, false, &[]) {
+            pol.aplicar(&c);
+        }
+    }
+
     loop {
 
         let quiere_monitorear = pol.monitorea();
